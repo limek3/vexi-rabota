@@ -13,6 +13,7 @@ from .models import Group, Lead, MonthPlan, Operator, Settings
 
 log = logging.getLogger(__name__)
 Send = Callable[[str], Awaitable[None]]
+EVENT_NAMESPACE = "done_v2"
 
 
 @dataclass(slots=True)
@@ -37,15 +38,24 @@ class EventEngine:
     def update_reference(self, ref: ReferenceData) -> None:
         self.ref = ref
 
+    @staticmethod
+    def _event_key(key: str) -> str:
+        # v2 separates approved-only achievements from the old implementation
+        # where both ``work`` and ``done`` leads were counted. Keeping a new
+        # namespace means existing rows in telegram_bot_events cannot suppress
+        # a future correct notification.
+        return f"{EVENT_NAMESPACE}:{key}"
+
     async def _emit(self, key: str, typ: str, text: str, payload: dict) -> None:
-        claimed = await self.db.claim_event(key, typ, payload)
+        event_key = self._event_key(key)
+        claimed = await self.db.claim_event(event_key, typ, payload)
         if not claimed:
             return
         try:
             await self.sender(text)
-            log.info("Sent event %s", key)
+            log.info("Sent event %s", event_key)
         except Exception:
-            await self.db.release_event(key)
+            await self.db.release_event(event_key)
             raise
 
     async def process_lead_change(self, lead: Lead) -> None:
@@ -246,4 +256,4 @@ class EventEngine:
             prev = self.cache.team_previous_record(day)
             if prev > 0 and count > prev:
                 out.append((f"team_record:{day}", "team_record", {"seeded": True}))
-        return out
+        return [(self._event_key(key), typ, payload) for key, typ, payload in out]

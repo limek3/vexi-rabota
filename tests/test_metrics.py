@@ -11,20 +11,29 @@ def op(**kw):
     return Operator(**base)
 
 
-def test_failed_lead_does_not_count():
+def test_only_done_leads_count():
     c = MetricsCache()
     c.load([
         Lead("1", "2026-09-22T10:00", "op1", "g1", "work", "1"),
         Lead("2", "2026-09-22T11:00", "op1", "g1", "failed", "2"),
+        Lead("3", "2026-09-22T12:00", "op1", "g1", "done", "3"),
     ])
     assert c.op_day_count("op1", "2026-09-22") == 1
     assert c.group_day_count("g1", "2026-09-22") == 1
     assert c.team_day_count("2026-09-22") == 1
 
 
-def test_status_change_updates_counts():
+def test_work_to_done_increments_count():
     c = MetricsCache()
     c.load([Lead("1", "2026-09-22T10:00", "op1", "g1", "work", "1")])
+    assert c.op_day_count("op1", "2026-09-22") == 0
+    c.apply(Lead("1", "2026-09-22T10:00", "op1", "g1", "done", "2"))
+    assert c.op_day_count("op1", "2026-09-22") == 1
+
+
+def test_done_to_failed_decrements_count():
+    c = MetricsCache()
+    c.load([Lead("1", "2026-09-22T10:00", "op1", "g1", "done", "1")])
     c.apply(Lead("1", "2026-09-22T10:00", "op1", "g1", "failed", "2"))
     assert c.op_day_count("op1", "2026-09-22") == 0
 
@@ -56,9 +65,9 @@ def test_grade_counts_are_separate_for_each_day():
     c = MetricsCache()
     leads = []
     for i in range(11):
-        leads.append(Lead(f"d1-{i}", f"2026-09-22T10:{i:02d}", "op1", "g1", "work", str(i)))
+        leads.append(Lead(f"d1-{i}", f"2026-09-22T10:{i:02d}", "op1", "g1", "done", str(i)))
     for i in range(6):
-        leads.append(Lead(f"d2-{i}", f"2026-09-23T10:{i:02d}", "op1", "g1", "work", str(100+i)))
+        leads.append(Lead(f"d2-{i}", f"2026-09-23T10:{i:02d}", "op1", "g1", "done", str(100+i)))
     c.load(leads)
     assert c.op_day_count("op1", "2026-09-22") == 11
     assert c.op_day_count("op1", "2026-09-23") == 6

@@ -151,10 +151,10 @@ class LeadupBot:
         self.ref = ref
         self.engine = EventEngine(self.db, self.cache, ref, self.send_event)
 
-        initialized = await self.db.get_state("initialized_v1")
+        initialized = await self.db.get_state("initialized_done_v2")
         if initialized != "1":
             seeded = await self.db.seed_events(self.engine.existing_event_keys())
-            await self.db.set_state("initialized_v1", "1")
+            await self.db.set_state("initialized_done_v2", "1")
             log.info("First startup: seeded %s existing achievements without posting them", seeded)
 
         # Reconcile the latest active day. On the first ever run all existing keys were seeded above,

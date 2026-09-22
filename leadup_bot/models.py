@@ -24,7 +24,11 @@ class Lead:
 
     @property
     def counts(self) -> bool:
-        return self.status != "failed"
+        # Telegram achievements are based only on leads approved by a supervisor.
+        # LEADUP stores the visible status «Доведён» as ``done``.
+        # ``work`` (В работе) and ``failed`` (Не доведён) must not affect
+        # grades, records, daily plans or monthly plans.
+        return self.status == "done"
 
 
 @dataclass(slots=True)
