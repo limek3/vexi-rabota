@@ -21,6 +21,7 @@ from . import messages
 from .config import Config
 from .db import SupabaseDB
 from .events import EventEngine, ReferenceData
+from .grades import local_today
 from .metrics import MetricsCache
 from .models import Operator
 from .tag_sync import TagSync
@@ -187,7 +188,7 @@ class LeadupBot:
         if self.tag_sync:
             self.tag_sync.invalidate_rights()
             rights = await self.tag_sync.rights(chat.id, force=True)
-            rights_line = f"\nУправление тегами: <b>{messages.RIGHTS_LABELS.get(rights, rights)}</b>"
+            rights_line = f"\nУправление тегами: {messages.RIGHTS_LABELS.get(rights, rights)}"
         await msg.reply_text(
             "✅ <b>ЧАТ ПОДКЛЮЧЕН</b>\n\n"
             "Vexi теперь связан с LEADUP.\n"
@@ -222,25 +223,25 @@ class LeadupBot:
         self._chat_cache = (chat_id, asyncio.get_running_loop().time())
         lines = [
             "🟢 <b>VEXI BOT · ONLINE</b>\n",
-            f"Telegram чат: <b>{'подключен' if chat_id else 'не подключен'}</b>",
-            "Supabase: <b>подключен</b>",
+            f"Telegram чат: {'подключен' if chat_id else 'не подключен'}",
+            "Supabase: подключен",
         ]
         rights = None
         if not self.tag_sync:
-            lines.append("Управление тегами: <b>выключено — не выполнена миграция привязки Telegram</b>")
+            lines.append("Управление тегами: выключено — не выполнена миграция привязки Telegram")
         else:
             if chat_id:
                 rights = await self.tag_sync.rights(chat_id, force=True)
-                lines.append(f"Управление тегами: <b>{messages.RIGHTS_LABELS.get(rights, rights)}</b>")
+                lines.append(f"Управление тегами: {messages.RIGHTS_LABELS.get(rights, rights)}")
             else:
-                lines.append("Управление тегами: <b>сначала подключите чат через /connect</b>")
+                lines.append("Управление тегами: сначала подключите чат через /connect")
             links = self.tag_sync.links.values()
-            lines.append(f"Привязано операторов: <b>{len(self.tag_sync.links)}</b>")
+            lines.append(f"Привязано операторов: {len(self.tag_sync.links)}")
             not_in_chat = sum(1 for x in links if x.chat_status == "not_member")
             if not_in_chat:
-                lines.append(f"Не найдены в чате: <b>{not_in_chat}</b>")
-        lines.append(f"Лидов в кэше: <b>{len(self.cache.leads)}</b>")
-        lines.append(f"Проверка базы: каждые <b>{self.cfg.poll_interval} сек.</b>")
+                lines.append(f"Не найдены в чате: {not_in_chat}")
+        lines.append(f"Лидов в кэше: {len(self.cache.leads)}")
+        lines.append(f"Проверка базы: каждые {self.cfg.poll_interval} сек.")
         text = "\n".join(lines)
         if rights in RIGHTS_MISSING:
             text += "\n\n" + messages.rights_warning(rights)
@@ -366,6 +367,7 @@ class LeadupBot:
         self.engine = EventEngine(
             self.db, self.cache, ref, self.send_event,
             on_operator_change=self.on_operator_change, mention=self.mention,
+            today=lambda: local_today(self.cfg.app_timezone),
         )
 
         initialized = await self.db.get_state("initialized_done_v2")

@@ -18,6 +18,8 @@ Send = Callable[[str], Awaitable[None]]
 OperatorHook = Callable[[str], Awaitable[None]]
 # Как назвать оператора в уведомлении (HTML): «@username Фамилия Имя», если Telegram привязан.
 Mention = Callable[[Operator], str]
+# «Сегодня» по APP_TIMEZONE: подсказка «ещё 1 лид» имеет смысл только в текущей смене.
+Today = Callable[[], str]
 EVENT_NAMESPACE = "done_v2"
 
 
@@ -34,6 +36,7 @@ class EventEngine:
         self, db: SupabaseDB, cache: MetricsCache, ref: ReferenceData, sender: Send,
         on_operator_change: OperatorHook | None = None,
         mention: Mention | None = None,
+        today: Today | None = None,
     ) -> None:
         self.db = db
         self.cache = cache
@@ -41,6 +44,7 @@ class EventEngine:
         self.sender = sender
         self.on_operator_change = on_operator_change
         self.mention = mention
+        self.today = today
 
     def _who(self, op: Operator) -> str | None:
         if not self.mention:
@@ -50,6 +54,23 @@ class EventEngine:
         except Exception:
             log.exception("Mention failed for %s", op.id)
             return None
+
+    def _is_today(self, day: str) -> bool:
+        return self.today is None or self.today() == day
+
+    async def _grade_soon(self, op: Operator, day: str, count: int, reconciled: bool = False) -> None:
+        """За 1 доведённый лид до ступени (5, 7, 10) — подсказка в чат. Только в текущей смене
+        и ровно на этом счёте: если уже 6+, «ещё 1 лид» устарело. Раз в день на ступень."""
+        grade_no = messages.GRADE_SOON.get(count)
+        if not grade_no or not self._is_today(day):
+            return
+        payload = {"operator_id": op.id, "operator_name": op.name, "day": day, "count": count, "grade": grade_no}
+        if reconciled:
+            payload["reconciled"] = True
+        await self._emit(
+            f"grade_soon:{day}:{op.id}:{messages.GRADE_AT[grade_no]}", "grade_soon",
+            messages.grade_soon(op.name, count, who=self._who(op)), payload,
+        )
 
     @property
     def plans(self) -> PlanResolver:
@@ -116,6 +137,9 @@ class EventEngine:
                 f"grade:{day}:{op.id}:{count}", "grade", messages.grade(op.name, count, who=self._who(op)),
                 {"operator_id": op.id, "operator_name": op.name, "day": day, "count": count, "grade": grade_no},
             )
+
+        # 1b) One lead before the next grade (5, 7, 10) — nudge in the chat.
+        await self._grade_soon(op, day, count)
 
         # 2) Personal record: public only from 6+, and only first record break per operator per day.
         previous = self.cache.op_previous_record(op.id, day)
@@ -197,6 +221,7 @@ class EventEngine:
                         f"grade:{day}:{op.id}:{threshold}", "grade", messages.grade(op.name, threshold, who=self._who(op)),
                         {"operator_id": op.id, "operator_name": op.name, "day": day, "count": threshold, "grade": grade_no, "reconciled": True},
                     )
+            await self._grade_soon(op, day, count, reconciled=True)
             previous = self.cache.op_previous_record(op.id, day)
             if count >= 6 and previous > 0 and count > previous:
                 await self._emit(
@@ -261,6 +286,8 @@ class EventEngine:
             for threshold in (6, 8, 11):
                 if count >= threshold:
                     out.append((f"grade:{day}:{op_id}:{threshold}", "grade", {"seeded": True}))
+                if count >= threshold - 1:
+                    out.append((f"grade_soon:{day}:{op_id}:{threshold}", "grade_soon", {"seeded": True}))
             prev = self.cache.op_previous_record(op_id, day)
             if count >= 6 and prev > 0 and count > prev:
                 out.append((f"personal_record:{day}:{op_id}", "personal_record", {"seeded": True}))

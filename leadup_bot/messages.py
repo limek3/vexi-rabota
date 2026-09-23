@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import html
 import math
 from datetime import date
@@ -36,6 +37,20 @@ def plural_leads(value: int) -> str:
     return "лидов"
 
 
+# Оформление уведомлений везде одно: жирный — только заголовок, текст и цитата — обычным шрифтом.
+
+# Ставка ступени (₽/ч, ₽ за лид) и порог в доведённых лидах за смену.
+GRADE_RATES: dict[str, tuple[int, int]] = {"II": (230, 75), "III": (240, 80), "IV": (260, 90)}
+GRADE_AT: dict[str, int] = {"II": 6, "III": 8, "IV": 11}
+# За один лид до ступени: 5 → II, 7 → III, 10 → IV.
+GRADE_SOON: dict[int, str] = {at - 1: g for g, at in GRADE_AT.items()}
+
+
+def rate_line(grade_no: str) -> str:
+    hourly, bonus = GRADE_RATES[grade_no]
+    return f"💰 {hourly} ₽/ч + {bonus} ₽ за лид"
+
+
 def grade(name: str, count: int, who: str | None = None) -> str:
     # Грейд относится только к текущей смене/календарному дню.
     # На следующий день счетчик начинается заново, поэтому оператор снова
@@ -44,30 +59,41 @@ def grade(name: str, count: int, who: str | None = None) -> str:
     if count == 6:
         return (
             "🚀 <b>НОВЫЙ ГРЕЙД</b>\n\n"
-            f"<b>6 лидов. {who} переходит на Грейд II.</b>\n\n"
-            "<blockquote>💰 <b>230 ₽/ч + 75 ₽ за лид</b>\n"
-            "До следующей ступени: <b>2 лида</b></blockquote>"
+            f"6 лидов. {who} переходит на Грейд II.\n\n"
+            f"<blockquote>{rate_line('II')}\n"
+            "До следующей ступени: 2 лида</blockquote>"
         )
     if count == 8:
         return (
             "🔥 <b>НОВЫЙ ГРЕЙД</b>\n\n"
-            f"<b>8 лидов. {who} переходит на Грейд III.</b>\n\n"
-            "<blockquote>💰 <b>240 ₽/ч + 80 ₽ за лид</b>\n"
-            "До следующей ступени: <b>3 лида</b></blockquote>"
+            f"8 лидов. {who} переходит на Грейд III.\n\n"
+            f"<blockquote>{rate_line('III')}\n"
+            "До следующей ступени: 3 лида</blockquote>"
         )
     return (
         "🏆 <b>МАКСИМАЛЬНЫЙ ГРЕЙД</b>\n\n"
-        f"<b>11 лидов. {who} переходит на Грейд IV.</b>\n\n"
-        "<blockquote>💰 <b>260 ₽/ч + 90 ₽ за лид</b>\n"
+        f"11 лидов. {who} переходит на Грейд IV.\n\n"
+        f"<blockquote>{rate_line('IV')}\n"
         "Максимальная ступень на сегодня достигнута.</blockquote>"
+    )
+
+
+def grade_soon(name: str, count: int, who: str | None = None) -> str:
+    """За один доведённый лид до новой ступени: 5, 7 или 10 лидов."""
+    grade_no = GRADE_SOON[count]
+    return (
+        f"⏳ <b>ЕЩЁ 1 ЛИД ДО ГРЕЙДА {grade_no}</b>\n\n"
+        f"{count} {plural_leads(count)}. {who or e(name)} — ещё 1 лид, и откроется Грейд {grade_no}.\n\n"
+        f"<blockquote>{rate_line(grade_no)}\n"
+        f"Ставка за смену и бонус за каждый лид — с {GRADE_AT[grade_no]}-го лида</blockquote>"
     )
 
 
 def personal_record(name: str, current: int, previous: int, who: str | None = None) -> str:
     return (
         "🏆 <b>ЛИЧНЫЙ РЕКОРД</b>\n\n"
-        f"<b>{who or e(name)} — новый личный рекорд: {current} {plural_leads(current)} за смену.</b>\n\n"
-        f"<blockquote>Предыдущий рекорд: <b>{previous}</b>\nНовый рекорд: <b>{current}</b></blockquote>"
+        f"{who or e(name)} — новый личный рекорд: {current} {plural_leads(current)} за смену.\n\n"
+        f"<blockquote>Предыдущий рекорд: {previous}\nНовый рекорд: {current}</blockquote>"
     )
 
 
@@ -75,66 +101,65 @@ def daily_plan(name: str, fact: int, daily_plan_value: float, who: str | None = 
     target = math.ceil(daily_plan_value - 1e-9)
     return (
         "✅ <b>ПЛАН ДНЯ ЗАКРЫТ</b>\n\n"
-        f"<b>{who or e(name)} закрывает дневной план.</b>\n\n"
-        f"<blockquote>Результат: <b>{fact} / {target}</b> {plural_leads(target)}</blockquote>"
+        f"{who or e(name)} закрывает дневной план.\n\n"
+        f"<blockquote>Результат: {fact} / {target} {plural_leads(target)}</blockquote>"
     )
+
+
+def _month_left(day: str) -> tuple[bool, str]:
+    """Досрочно ли (не последний день месяца) и строка «До конца месяца: N дн.»."""
+    d = date.fromisoformat(day)
+    last_day = calendar.monthrange(d.year, d.month)[1]
+    early = d.day < last_day
+    return early, (f"\nДо конца месяца: {last_day - d.day} дн." if early else "")
 
 
 def operator_month_plan(name: str, fact: int, plan: float, day: str, who: str | None = None) -> str:
     target = math.ceil(plan - 1e-9)
-    d = date.fromisoformat(day)
-    last_day = __import__("calendar").monthrange(d.year, d.month)[1]
-    early = d.day < last_day
+    early, extra = _month_left(day)
     title = "⚡ <b>ПЛАН ВЫПОЛНЕН ДОСРОЧНО</b>" if early else "🎯 <b>ПЛАН МЕСЯЦА ВЫПОЛНЕН</b>"
-    extra = f"\nДо конца месяца: <b>{last_day - d.day} дн.</b>" if early else ""
     return (
         f"{title}\n\n"
-        f"<b>{who or e(name)} выходит на 100% месячного плана.</b>\n\n"
-        f"<blockquote>Факт: <b>{fact}</b>\nПлан: <b>{target}</b>{extra}</blockquote>"
+        f"{who or e(name)} выходит на 100% месячного плана.\n\n"
+        f"<blockquote>Факт: {fact}\nПлан: {target}{extra}</blockquote>"
     )
 
 
 def group_month_plan(group_name: str, fact: int, plan: float, day: str) -> str:
     target = math.ceil(plan - 1e-9)
-    d = date.fromisoformat(day)
-    last_day = __import__("calendar").monthrange(d.year, d.month)[1]
-    early = d.day < last_day
+    early, extra = _month_left(day)
     title = "⚡ <b>ГРУППА ЗАКРЫЛА ПЛАН ДОСРОЧНО</b>" if early else "🎯 <b>ПЛАН ГРУППЫ ВЫПОЛНЕН</b>"
-    extra = f"\nДо конца месяца: <b>{last_day - d.day} дн.</b>" if early else ""
     return (
         f"{title}\n\n"
-        f"<b>Группа «{e(group_name)}» вышла на 100% месячного плана.</b>\n\n"
-        f"<blockquote>Факт: <b>{fact}</b>\nПлан: <b>{target}</b>{extra}</blockquote>"
+        f"Группа «{e(group_name)}» вышла на 100% месячного плана.\n\n"
+        f"<blockquote>Факт: {fact}\nПлан: {target}{extra}</blockquote>"
     )
 
 
 def team_month_plan(company: str, fact: int, plan: float, day: str) -> str:
     target = math.ceil(plan - 1e-9)
-    d = date.fromisoformat(day)
-    last_day = __import__("calendar").monthrange(d.year, d.month)[1]
-    early = d.day < last_day
+    early, extra = _month_left(day)
     title = "🚀 <b>ПЛАН ОТДЕЛА ЗАКРЫТ ДОСРОЧНО</b>" if early else "🎯 <b>ПЛАН ОТДЕЛА ВЫПОЛНЕН</b>"
-    extra = f"\nДо конца месяца: <b>{last_day - d.day} дн.</b>" if early else ""
     return (
         f"{title}\n\n"
-        f"<b>{e(company)} вышел на 100% месячного плана.</b>\n\n"
-        f"<blockquote>Факт: <b>{fact}</b>\nПлан: <b>{target}</b>{extra}</blockquote>"
+        f"{e(company)} вышел на 100% месячного плана.\n\n"
+        f"<blockquote>Факт: {fact}\nПлан: {target}{extra}</blockquote>"
     )
 
 
 def group_record(group_name: str, current: int, previous: int) -> str:
     return (
         "🔥 <b>РЕКОРД ГРУППЫ ПОБИТ</b>\n\n"
-        f"<b>Группа «{e(group_name)}» установила новый результат — {current} {plural_leads(current)} за день.</b>\n\n"
-        f"<blockquote>Предыдущий рекорд: <b>{previous}</b>\nНовый рекорд: <b>{current}</b></blockquote>"
+        f"Группа «{e(group_name)}» установила новый результат — {current} {plural_leads(current)} за день.\n\n"
+        f"<blockquote>Предыдущий рекорд: {previous}\nНовый рекорд: {current}</blockquote>"
     )
 
 
 def team_record(company: str, current: int, previous: int) -> str:
     return (
         "🚀 <b>НОВЫЙ РЕКОРД ОТДЕЛА</b>\n\n"
-        f"<b>{e(company)} установил лучший результат за всю историю — {current} {plural_leads(current)} за день.</b>\n\n"
-        f"<blockquote>Предыдущий рекорд: <b>{previous}</b>\nНовый рекорд: <b>{current}</b></blockquote>"
+        f"{e(company)} установил лучший результат за всю историю — {current} {plural_leads(current)} за день.\n\n"
+        f"<blockquote>Предыдущий рекорд: {previous}\nНовый рекорд: {current}</blockquote>"
     )
 
 
@@ -175,9 +200,9 @@ def link_success(name: str, tag: str, note: str = "") -> str:
     extra = f"\n\n{note}" if note else ""
     return (
         "✅ <b>TELEGRAM ПОДКЛЮЧЕН</b>\n\n"
-        f"<b>{e(name)}</b>\n\n"
+        f"{e(name)}\n\n"
         "<blockquote>Аккаунт успешно связан с LEADUP\n"
-        f"Текущий тег: <b>{e(tag)}</b></blockquote>"
+        f"Текущий тег: {e(tag)}</blockquote>"
         f"{extra}"
     )
 

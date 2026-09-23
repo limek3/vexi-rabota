@@ -706,3 +706,97 @@ def test_grade_notification_mentions_linked_operator() -> None:
         assert bot.mention(op()) == "Мария Соколова"
 
     run(scenario())
+
+
+# ── «Ещё 1 лид до грейда» и оформление ─────────────────────────────────────
+
+def test_grade_soon_text() -> None:
+    from leadup_bot import messages
+
+    t = messages.grade_soon("Оленчук Борис", 5, who="@boris Оленчук Борис")
+    assert t.startswith("⏳ <b>ЕЩЁ 1 ЛИД ДО ГРЕЙДА II</b>")
+    assert "5 лидов. @boris Оленчук Борис — ещё 1 лид, и откроется Грейд II." in t
+    assert "💰 230 ₽/ч + 75 ₽ за лид" in t
+    assert "ЕЩЁ 1 ЛИД ДО ГРЕЙДА III" in messages.grade_soon("x", 7) and "240 ₽/ч + 80 ₽" in messages.grade_soon("x", 7)
+    assert "ЕЩЁ 1 ЛИД ДО ГРЕЙДА IV" in messages.grade_soon("x", 10) and "260 ₽/ч + 90 ₽" in messages.grade_soon("x", 10)
+
+
+def test_only_title_is_bold_everywhere() -> None:
+    from leadup_bot import messages
+
+    texts = [
+        messages.grade("Иван", 6), messages.grade("Иван", 8), messages.grade("Иван", 11),
+        messages.grade_soon("Иван", 5), messages.personal_record("Иван", 9, 7), messages.daily_plan("Иван", 6, 5.2),
+        messages.operator_month_plan("Иван", 120, 110, "2026-09-23"), messages.group_month_plan("Альфа", 500, 480, "2026-09-30"),
+        messages.team_month_plan("Отдел", 900, 880, "2026-09-23"), messages.group_record("Альфа", 60, 55),
+        messages.team_record("Отдел", 140, 130), messages.link_success("Иван", "Грейд I"),
+    ]
+    for t in texts:
+        first, _, rest = t.partition("\n")
+        assert t.count("<b>") == 1 and "<b>" in first, t
+        assert "<b>" not in rest, t
+
+
+def _soon_engine(today: str | None):
+    store, cache, sent = FakeStore(), MetricsCache(), []
+
+    async def sender(text: str) -> None:
+        sent.append(text)
+
+    ops = {"op1": op(name="Оленчук Борис")}
+    engine = EventEngine(
+        store, cache, ReferenceData(ops, {}, {}, Settings()), sender,  # type: ignore[arg-type]
+        mention=lambda o: f"@boris {o.name}", today=(lambda: today) if today else None,
+    )
+    return engine, cache, sent
+
+
+def test_fifth_done_lead_announces_one_more_to_grade_two() -> None:
+    async def scenario() -> None:
+        engine, cache, sent = _soon_engine(DAY)
+        cache.load([lead(i) for i in range(4)] + [lead(4, "work")])
+        await engine.process_lead_change(lead(4, "done"))            # 4 → 5
+        assert len(sent) == 1 and "ЕЩЁ 1 ЛИД ДО ГРЕЙДА II" in sent[0] and "@boris Оленчук Борис" in sent[0]
+        await engine.process_lead_change(lead(4, "done"))            # повтор — без дубля
+        assert len(sent) == 1
+        await engine.process_lead_change(lead(5, "done"))            # 5 → 6 — уже сам грейд
+        assert "НОВЫЙ ГРЕЙД" in sent[-1] and len(sent) == 2
+        for i in (6, 7, 8, 9):                                        # 7 и 10 — подсказки к III и IV
+            await engine.process_lead_change(lead(i, "done"))
+        titles = [t.split("\n")[0] for t in sent]
+        assert "⏳ <b>ЕЩЁ 1 ЛИД ДО ГРЕЙДА III</b>" in titles
+        assert "⏳ <b>ЕЩЁ 1 ЛИД ДО ГРЕЙДА IV</b>" in titles
+
+    run(scenario())
+
+
+def test_grade_soon_not_for_other_days_or_downgrade() -> None:
+    async def scenario() -> None:
+        # лид вчерашнего дня подтвердили сегодня — «ещё 1 лид» вчера уже бессмысленно
+        engine, cache, sent = _soon_engine(DAY)
+        cache.load([lead(i, day="2026-09-22") for i in range(4)] + [lead(4, "work", day="2026-09-22")])
+        await engine.process_lead_change(lead(4, "done", day="2026-09-22"))
+        assert not any("ЕЩЁ 1 ЛИД" in t for t in sent)
+
+        # 6 → 5 (доведённый стал «не доведён») — подсказку не шлём
+        engine, cache, sent = _soon_engine(DAY)
+        cache.load([lead(i) for i in range(6)])
+        await engine.process_lead_change(lead(5, "failed"))
+        assert sent == []
+
+    run(scenario())
+
+
+def test_grade_soon_reconciled_after_restart_only_if_still_actual() -> None:
+    async def scenario() -> None:
+        engine, cache, sent = _soon_engine(DAY)
+        cache.load([lead(i) for i in range(5)])
+        await engine.reconcile_day(DAY)
+        assert len([t for t in sent if "ЕЩЁ 1 ЛИД ДО ГРЕЙДА II" in t]) == 1
+
+        engine, cache, sent = _soon_engine(DAY)
+        cache.load([lead(i) for i in range(6)])                        # уже 6 — подсказка устарела
+        await engine.reconcile_day(DAY)
+        assert not any("ЕЩЁ 1 ЛИД" in t for t in sent)
+
+    run(scenario())
