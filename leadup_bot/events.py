@@ -13,6 +13,9 @@ from .models import Group, Lead, MonthPlan, Operator, Settings
 
 log = logging.getLogger(__name__)
 Send = Callable[[str], Awaitable[None]]
+# Вызывается при любом изменении лида для затронутых операторов — до поздравлений,
+# чтобы тег в чате сменился раньше, чем придёт сообщение о новом грейде.
+OperatorHook = Callable[[str], Awaitable[None]]
 EVENT_NAMESPACE = "done_v2"
 
 
@@ -25,11 +28,15 @@ class ReferenceData:
 
 
 class EventEngine:
-    def __init__(self, db: SupabaseDB, cache: MetricsCache, ref: ReferenceData, sender: Send) -> None:
+    def __init__(
+        self, db: SupabaseDB, cache: MetricsCache, ref: ReferenceData, sender: Send,
+        on_operator_change: OperatorHook | None = None,
+    ) -> None:
         self.db = db
         self.cache = cache
         self.ref = ref
         self.sender = sender
+        self.on_operator_change = on_operator_change
 
     @property
     def plans(self) -> PlanResolver:
@@ -58,11 +65,27 @@ class EventEngine:
             await self.db.release_event(event_key)
             raise
 
+    async def _notify_operators(self, lead: Lead, old: Lead | None) -> None:
+        """Грейд может и расти (work → done), и падать (done → failed, лид переназначен) —
+        сообщаем о каждом затронутом операторе. Ошибка тегов не мешает поздравлениям."""
+        if not self.on_operator_change:
+            return
+        affected = [lead.operator_id]
+        if old and old.operator_id != lead.operator_id:
+            affected.append(old.operator_id)
+        for op_id in affected:
+            try:
+                await self.on_operator_change(op_id)
+            except Exception:
+                log.exception("Operator change hook failed for %s", op_id)
+
     async def process_lead_change(self, lead: Lead) -> None:
         # Re-evaluate even when this exact row is retried after a transient error.
         # Event keys make the operation idempotent, while this prevents a failed Telegram
         # send from being lost merely because the in-memory cache already saw the row.
+        old = self.cache.leads.get(lead.id)
         self.cache.apply(lead)
+        await self._notify_operators(lead, old)
         if not lead.counts:
             return
         op = self.ref.operators.get(lead.operator_id)

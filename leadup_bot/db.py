@@ -8,7 +8,15 @@ from typing import Any, Iterable
 
 import httpx
 
-from .models import Group, Lead, MonthPlan, Operator, Settings
+from .models import (
+    Group,
+    Lead,
+    MonthPlan,
+    Operator,
+    PendingUnlink,
+    Settings,
+    TelegramLink,
+)
 
 log = logging.getLogger(__name__)
 
@@ -175,6 +183,71 @@ class SupabaseDB:
             await self._request("DELETE", "telegram_bot_events", params={"event_key": f"eq.{event_key}"})
         except Exception:
             log.exception("Failed to release event %s", event_key)
+
+    # ── Привязка Telegram (supabase/migrations/20260923000001_telegram_link.sql) ──
+
+    async def telegram_links_available(self) -> bool:
+        """Есть ли таблицы привязки. Нет — миграцию ещё не выполнили: бот работает как раньше, без тегов."""
+        r = await self.client.get(f"{self.base}/operator_telegram", params={"select": "operator_id", "limit": "1"})
+        if r.status_code == 200:
+            return True
+        if r.status_code >= 500:
+            r.raise_for_status()
+        log.warning("telegram.links.unavailable status=%s — apply supabase/migrations/20260923000001_telegram_link.sql", r.status_code)
+        return False
+
+    async def load_links(self) -> list[TelegramLink]:
+        rows = await self.fetch_all(
+            "operator_telegram",
+            select="operator_id,telegram_user_id,telegram_username,telegram_first_name,telegram_last_name,"
+            "tag_synced,tag_chat_id,chat_status,last_error",
+            params={"order": "operator_id.asc"},
+        )
+        return [TelegramLink.from_row(r) for r in rows]
+
+    async def update_link_state(self, operator_id: str, telegram_user_id: int, fields: dict[str, Any]) -> None:
+        """Состояние тега в строке привязки. Фильтр по telegram_user_id: если человек за это время
+        отвязался или переподключил другой Telegram, чужую строку не трогаем."""
+        body = {**fields, "updated_at": datetime.now(timezone.utc).isoformat()}
+        await self._request(
+            "PATCH", "operator_telegram",
+            params={"operator_id": f"eq.{operator_id}", "telegram_user_id": f"eq.{telegram_user_id}"},
+            json=body, headers={**self.headers, "Prefer": "return=minimal"},
+        )
+
+    async def consume_link_code(
+        self, code: str, telegram_user_id: int, username: str | None, first_name: str | None, last_name: str | None,
+    ) -> dict[str, Any]:
+        r = await self._request(
+            "POST", "rpc/telegram_link_consume",
+            json={
+                "p_code": code, "p_telegram_user_id": telegram_user_id,
+                "p_username": username, "p_first_name": first_name, "p_last_name": last_name,
+            },
+        )
+        data = r.json()
+        return data if isinstance(data, dict) else {"ok": False, "reason": "bad_response"}
+
+    async def pending_unlinks(self, limit: int = 50) -> list[PendingUnlink]:
+        r = await self._request(
+            "GET", "telegram_unlinks",
+            params={
+                "select": "id,operator_id,telegram_user_id,unlinked_at",
+                "processed_at": "is.null", "order": "unlinked_at.asc", "limit": str(limit),
+            },
+        )
+        return [
+            PendingUnlink(id=int(x["id"]), operator_id=str(x["operator_id"]),
+                          telegram_user_id=int(x["telegram_user_id"]), unlinked_at=str(x["unlinked_at"]))
+            for x in r.json()
+        ]
+
+    async def finish_unlink(self, unlink_id: int, result: str) -> None:
+        await self._request(
+            "PATCH", "telegram_unlinks", params={"id": f"eq.{unlink_id}"},
+            json={"processed_at": datetime.now(timezone.utc).isoformat(), "cleanup_result": result},
+            headers={**self.headers, "Prefer": "return=minimal"},
+        )
 
     async def seed_events(self, items: Iterable[tuple[str, str, dict[str, Any]]]) -> int:
         rows = [

@@ -90,3 +90,47 @@ class Settings:
 def month_start(month: str) -> date:
     year, mon = map(int, month.split("-"))
     return date(year, mon, 1)
+
+
+@dataclass(slots=True)
+class TelegramLink:
+    """Привязка карточки оператора к Telegram (таблица operator_telegram).
+
+    Идентификатор человека — только ``telegram_user_id``. username/имя — для показа.
+    ``tag_synced`` — последний тег, который Vexi подтвердил в рабочем чате
+    ('' — тег снят, None — неизвестно, надо проверить).
+    """
+
+    operator_id: str
+    telegram_user_id: int
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    tag_synced: str | None = None
+    tag_chat_id: int | None = None
+    chat_status: str = "unknown"
+    last_error: str | None = None
+
+    @classmethod
+    def from_row(cls, r: dict[str, Any]) -> TelegramLink:
+        return cls(
+            operator_id=str(r["operator_id"]),
+            telegram_user_id=int(r["telegram_user_id"]),
+            username=r.get("telegram_username"),
+            first_name=r.get("telegram_first_name"),
+            last_name=r.get("telegram_last_name"),
+            tag_synced=r.get("tag_synced"),
+            tag_chat_id=(int(r["tag_chat_id"]) if r.get("tag_chat_id") is not None else None),
+            chat_status=str(r.get("chat_status") or "unknown"),
+            last_error=r.get("last_error"),
+        )
+
+
+@dataclass(slots=True)
+class PendingUnlink:
+    """Отвязанный Telegram, с которого бот ещё не снял тег (таблица telegram_unlinks)."""
+
+    id: int
+    operator_id: str
+    telegram_user_id: int
+    unlinked_at: str

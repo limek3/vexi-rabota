@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,6 +39,14 @@ def _ids(name: str) -> frozenset[int]:
     return frozenset(out)
 
 
+def _tz(name: str, default: str) -> ZoneInfo:
+    raw = os.getenv(name, "").strip() or default
+    try:
+        return ZoneInfo(raw)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise RuntimeError(f"Environment variable {name} must be an IANA timezone like Europe/Moscow, got: {raw}") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     telegram_token: str
@@ -47,9 +57,17 @@ class Config:
     poll_interval: int
     reference_refresh: int
     log_level: str
+    # Часовой пояс, в котором считается «сегодня» для дневных грейдов.
+    app_timezone: ZoneInfo
+    # Имя бота для ссылок t.me/<bot>?start=… Пусто — берётся из getMe() при старте.
+    bot_username: str
+    # Как часто сверять теги всех привязанных операторов (без лишних запросов к Telegram).
+    tag_reconcile_interval: int
+    # Как часто перепроверять теги прямо в Telegram (getChatMember), даже если в базе всё сходится.
+    tag_verify_interval: int
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls) -> Config:
         return cls(
             telegram_token=_required("TELEGRAM_BOT_TOKEN"),
             supabase_url=_required("SUPABASE_URL").rstrip("/"),
@@ -59,4 +77,8 @@ class Config:
             poll_interval=_int("POLL_INTERVAL_SECONDS", 4),
             reference_refresh=_int("REFERENCE_REFRESH_SECONDS", 30),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper().strip() or "INFO",
+            app_timezone=_tz("APP_TIMEZONE", "Europe/Moscow"),
+            bot_username=os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@"),
+            tag_reconcile_interval=_int("TAG_RECONCILE_SECONDS", 300, minimum=30),
+            tag_verify_interval=_int("TAG_VERIFY_SECONDS", 3600, minimum=300),
         )
