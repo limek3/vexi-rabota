@@ -16,6 +16,8 @@ Send = Callable[[str], Awaitable[None]]
 # Вызывается при любом изменении лида для затронутых операторов — до поздравлений,
 # чтобы тег в чате сменился раньше, чем придёт сообщение о новом грейде.
 OperatorHook = Callable[[str], Awaitable[None]]
+# Как назвать оператора в уведомлении (HTML): «@username Фамилия Имя», если Telegram привязан.
+Mention = Callable[[Operator], str]
 EVENT_NAMESPACE = "done_v2"
 
 
@@ -31,12 +33,23 @@ class EventEngine:
     def __init__(
         self, db: SupabaseDB, cache: MetricsCache, ref: ReferenceData, sender: Send,
         on_operator_change: OperatorHook | None = None,
+        mention: Mention | None = None,
     ) -> None:
         self.db = db
         self.cache = cache
         self.ref = ref
         self.sender = sender
         self.on_operator_change = on_operator_change
+        self.mention = mention
+
+    def _who(self, op: Operator) -> str | None:
+        if not self.mention:
+            return None
+        try:
+            return self.mention(op)
+        except Exception:
+            log.exception("Mention failed for %s", op.id)
+            return None
 
     @property
     def plans(self) -> PlanResolver:
@@ -100,7 +113,7 @@ class EventEngine:
         if count in (6, 8, 11):
             grade_no = {6: "II", 8: "III", 11: "IV"}[count]
             await self._emit(
-                f"grade:{day}:{op.id}:{count}", "grade", messages.grade(op.name, count),
+                f"grade:{day}:{op.id}:{count}", "grade", messages.grade(op.name, count, who=self._who(op)),
                 {"operator_id": op.id, "operator_name": op.name, "day": day, "count": count, "grade": grade_no},
             )
 
@@ -108,7 +121,7 @@ class EventEngine:
         previous = self.cache.op_previous_record(op.id, day)
         if count >= 6 and previous > 0 and count > previous:
             await self._emit(
-                f"personal_record:{day}:{op.id}", "personal_record", messages.personal_record(op.name, count, previous),
+                f"personal_record:{day}:{op.id}", "personal_record", messages.personal_record(op.name, count, previous, who=self._who(op)),
                 {"operator_id": op.id, "operator_name": op.name, "day": day, "count": count, "previous": previous},
             )
 
@@ -117,7 +130,7 @@ class EventEngine:
         target = math.ceil(dp - 1e-9) if dp > 0 else 0
         if target > 0 and count >= target:
             await self._emit(
-                f"daily_plan:{day}:{op.id}", "daily_plan", messages.daily_plan(op.name, count, dp),
+                f"daily_plan:{day}:{op.id}", "daily_plan", messages.daily_plan(op.name, count, dp, who=self._who(op)),
                 {"operator_id": op.id, "operator_name": op.name, "day": day, "fact": count, "plan": dp},
             )
 
@@ -126,7 +139,7 @@ class EventEngine:
         op_month = self.cache.op_month_count(op.id, month)
         if op_plan > 0 and op_month >= math.ceil(op_plan - 1e-9):
             await self._emit(
-                f"month_plan:operator:{month}:{op.id}", "month_plan_operator", messages.operator_month_plan(op.name, op_month, op_plan, day),
+                f"month_plan:operator:{month}:{op.id}", "month_plan_operator", messages.operator_month_plan(op.name, op_month, op_plan, day, who=self._who(op)),
                 {"operator_id": op.id, "operator_name": op.name, "month": month, "fact": op_month, "plan": op_plan, "day": day},
             )
 
@@ -181,26 +194,26 @@ class EventEngine:
                 if count >= threshold:
                     grade_no = {6: "II", 8: "III", 11: "IV"}[threshold]
                     await self._emit(
-                        f"grade:{day}:{op.id}:{threshold}", "grade", messages.grade(op.name, threshold),
+                        f"grade:{day}:{op.id}:{threshold}", "grade", messages.grade(op.name, threshold, who=self._who(op)),
                         {"operator_id": op.id, "operator_name": op.name, "day": day, "count": threshold, "grade": grade_no, "reconciled": True},
                     )
             previous = self.cache.op_previous_record(op.id, day)
             if count >= 6 and previous > 0 and count > previous:
                 await self._emit(
-                    f"personal_record:{day}:{op.id}", "personal_record", messages.personal_record(op.name, count, previous),
+                    f"personal_record:{day}:{op.id}", "personal_record", messages.personal_record(op.name, count, previous, who=self._who(op)),
                     {"operator_id": op.id, "operator_name": op.name, "day": day, "count": count, "previous": previous, "reconciled": True},
                 )
             dp = p.operator_daily_plan(op, day)
             if dp > 0 and count >= math.ceil(dp - 1e-9):
                 await self._emit(
-                    f"daily_plan:{day}:{op.id}", "daily_plan", messages.daily_plan(op.name, count, dp),
+                    f"daily_plan:{day}:{op.id}", "daily_plan", messages.daily_plan(op.name, count, dp, who=self._who(op)),
                     {"operator_id": op.id, "operator_name": op.name, "day": day, "fact": count, "plan": dp, "reconciled": True},
                 )
             op_plan = p.operator_plan(op, month)
             op_month = self.cache.op_month_count(op.id, month)
             if op_plan > 0 and op_month >= math.ceil(op_plan - 1e-9):
                 await self._emit(
-                    f"month_plan:operator:{month}:{op.id}", "month_plan_operator", messages.operator_month_plan(op.name, op_month, op_plan, day),
+                    f"month_plan:operator:{month}:{op.id}", "month_plan_operator", messages.operator_month_plan(op.name, op_month, op_plan, day, who=self._who(op)),
                     {"operator_id": op.id, "operator_name": op.name, "month": month, "fact": op_month, "plan": op_plan, "day": day, "reconciled": True},
                 )
 

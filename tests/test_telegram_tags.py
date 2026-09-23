@@ -670,3 +670,39 @@ def test_bootstrap_without_migration_keeps_old_behaviour(monkeypatch: pytest.Mon
         assert db.consumed == []
 
     run(scenario())
+
+
+# ── Упоминание оператора в уведомлениях ─────────────────────────────────────
+
+def test_mention_formats() -> None:
+    from leadup_bot import messages
+
+    assert messages.mention("Диникаев Айнур", "ainur_d", 777) == "@ainur_d Диникаев Айнур"
+    assert messages.mention("Диникаев Айнур", None, 777) == '<a href="tg://user?id=777">Диникаев Айнур</a>'
+    assert messages.mention("<Иван>", None, None) == "&lt;Иван&gt;"
+
+
+def test_grade_notification_mentions_linked_operator() -> None:
+    async def scenario() -> None:
+        db, tg, cache = LinkDB(), FakeTelegram(), MetricsCache()
+        tg.join(777)
+        cache.load([lead(i) for i in range(5)])
+        bot = _bot(db, tg, cache)
+        bot.cache = cache
+        db.rows["op1"] = linked(tag_synced="Грейд I", tag_chat_id=CHAT, chat_status="member")
+        await bot.tag_sync.load()
+        sent: list[str] = []
+
+        async def sender(text: str) -> None:
+            sent.append(text)
+
+        engine = EventEngine(db, cache, bot.ref, sender, on_operator_change=bot.on_operator_change, mention=bot.mention)  # type: ignore[arg-type]
+        await engine.process_lead_change(lead(5, "done"))
+        grade_msg = next(t for t in sent if "НОВЫЙ ГРЕЙД" in t)
+        assert "@maria Мария Соколова переходит на Грейд II" in grade_msg
+
+        # не привязан — просто имя, без @
+        bot.tag_sync.links.clear()
+        assert bot.mention(op()) == "Мария Соколова"
+
+    run(scenario())

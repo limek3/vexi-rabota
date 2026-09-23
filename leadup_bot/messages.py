@@ -14,6 +14,16 @@ def n(value: float | int) -> str:
     return f"{int(v):,}".replace(",", " ") if v.is_integer() else f"{v:,.1f}".replace(",", " ").replace(".0", "")
 
 
+def mention(name: str, username: str | None = None, telegram_user_id: int | None = None) -> str:
+    """Оператор в тексте уведомления: «@username Фамилия Имя» — Telegram подсветит и уведомит.
+    Без username — имя ссылкой tg://user?id=…; Telegram не привязан — просто имя."""
+    if username:
+        return f"@{e(username)} {e(name)}"
+    if telegram_user_id:
+        return f'<a href="tg://user?id={int(telegram_user_id)}">{e(name)}</a>'
+    return e(name)
+
+
 def plural_leads(value: int) -> str:
     x = abs(value) % 100
     y = x % 10
@@ -26,50 +36,51 @@ def plural_leads(value: int) -> str:
     return "лидов"
 
 
-def grade(name: str, count: int) -> str:
+def grade(name: str, count: int, who: str | None = None) -> str:
     # Грейд относится только к текущей смене/календарному дню.
     # На следующий день счетчик начинается заново, поэтому оператор снова
     # может пройти Грейд II -> III -> IV.
+    who = who or e(name)
     if count == 6:
         return (
             "🚀 <b>НОВЫЙ ГРЕЙД</b>\n\n"
-            f"<b>6 лидов. {e(name)} переходит на Грейд II.</b>\n\n"
+            f"<b>6 лидов. {who} переходит на Грейд II.</b>\n\n"
             "<blockquote>💰 <b>230 ₽/ч + 75 ₽ за лид</b>\n"
             "До следующей ступени: <b>2 лида</b></blockquote>"
         )
     if count == 8:
         return (
             "🔥 <b>НОВЫЙ ГРЕЙД</b>\n\n"
-            f"<b>8 лидов. {e(name)} переходит на Грейд III.</b>\n\n"
+            f"<b>8 лидов. {who} переходит на Грейд III.</b>\n\n"
             "<blockquote>💰 <b>240 ₽/ч + 80 ₽ за лид</b>\n"
             "До следующей ступени: <b>3 лида</b></blockquote>"
         )
     return (
         "🏆 <b>МАКСИМАЛЬНЫЙ ГРЕЙД</b>\n\n"
-        f"<b>11 лидов. {e(name)} переходит на Грейд IV.</b>\n\n"
+        f"<b>11 лидов. {who} переходит на Грейд IV.</b>\n\n"
         "<blockquote>💰 <b>260 ₽/ч + 90 ₽ за лид</b>\n"
         "Максимальная ступень на сегодня достигнута.</blockquote>"
     )
 
 
-def personal_record(name: str, current: int, previous: int) -> str:
+def personal_record(name: str, current: int, previous: int, who: str | None = None) -> str:
     return (
         "🏆 <b>ЛИЧНЫЙ РЕКОРД</b>\n\n"
-        f"<b>{e(name)} — новый личный рекорд: {current} {plural_leads(current)} за смену.</b>\n\n"
+        f"<b>{who or e(name)} — новый личный рекорд: {current} {plural_leads(current)} за смену.</b>\n\n"
         f"<blockquote>Предыдущий рекорд: <b>{previous}</b>\nНовый рекорд: <b>{current}</b></blockquote>"
     )
 
 
-def daily_plan(name: str, fact: int, daily_plan_value: float) -> str:
+def daily_plan(name: str, fact: int, daily_plan_value: float, who: str | None = None) -> str:
     target = math.ceil(daily_plan_value - 1e-9)
     return (
         "✅ <b>ПЛАН ДНЯ ЗАКРЫТ</b>\n\n"
-        f"<b>{e(name)} закрывает дневной план.</b>\n\n"
+        f"<b>{who or e(name)} закрывает дневной план.</b>\n\n"
         f"<blockquote>Результат: <b>{fact} / {target}</b> {plural_leads(target)}</blockquote>"
     )
 
 
-def operator_month_plan(name: str, fact: int, plan: float, day: str) -> str:
+def operator_month_plan(name: str, fact: int, plan: float, day: str, who: str | None = None) -> str:
     target = math.ceil(plan - 1e-9)
     d = date.fromisoformat(day)
     last_day = __import__("calendar").monthrange(d.year, d.month)[1]
@@ -78,7 +89,7 @@ def operator_month_plan(name: str, fact: int, plan: float, day: str) -> str:
     extra = f"\nДо конца месяца: <b>{last_day - d.day} дн.</b>" if early else ""
     return (
         f"{title}\n\n"
-        f"<b>{e(name)} выходит на 100% месячного плана.</b>\n\n"
+        f"<b>{who or e(name)} выходит на 100% месячного плана.</b>\n\n"
         f"<blockquote>Факт: <b>{fact}</b>\nПлан: <b>{target}</b>{extra}</blockquote>"
     )
 
@@ -150,7 +161,7 @@ def link_error(reason: str) -> str:
 def link_help() -> str:
     return (
         "🔗 <b>Привязка к LEADUP</b>\n\n"
-        "1. Откройте LEADUP → «Мой день» → блок Telegram → «Подключить Telegram».\n"
+        "1. Откройте LEADUP → «Настройки» → «Мой профиль» → блок Telegram → «Подключить Telegram».\n"
         "2. Нажмите «Открыть Vexi» — привязка пройдёт сама.\n\n"
         "Или отправьте код вручную: <code>/link 482913</code>"
     )

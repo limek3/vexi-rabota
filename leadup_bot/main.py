@@ -22,6 +22,7 @@ from .config import Config
 from .db import SupabaseDB
 from .events import EventEngine, ReferenceData
 from .metrics import MetricsCache
+from .models import Operator
 from .tag_sync import TagSync
 from .tags import RIGHTS_MISSING, RIGHTS_OK, TelegramTagApi
 
@@ -322,6 +323,13 @@ class LeadupBot:
             parse_mode=ParseMode.HTML,
         )
 
+    def mention(self, op: Operator) -> str:
+        """Оператор в уведомлении: «@username Фамилия Имя» (или имя-ссылка), если Telegram привязан."""
+        link = self.tag_sync.links.get(op.id) if self.tag_sync else None
+        if not link:
+            return messages.e(op.name)
+        return messages.mention(op.name, link.username, link.telegram_user_id)
+
     async def on_operator_change(self, operator_id: str) -> None:
         if self.tag_sync:
             await self.tag_sync.sync_operator(operator_id, reason="lead_change")
@@ -355,7 +363,10 @@ class LeadupBot:
         leads, ref = await asyncio.gather(self.db.load_leads(), self._load_reference())
         self.cache.load(leads)
         self.ref = ref
-        self.engine = EventEngine(self.db, self.cache, ref, self.send_event, on_operator_change=self.on_operator_change)
+        self.engine = EventEngine(
+            self.db, self.cache, ref, self.send_event,
+            on_operator_change=self.on_operator_change, mention=self.mention,
+        )
 
         initialized = await self.db.get_state("initialized_done_v2")
         if initialized != "1":
