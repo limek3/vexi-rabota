@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import httpx
@@ -96,6 +96,23 @@ class SupabaseDB:
             )
             for r in rows
         ]
+
+    async def day_leads(self, date_from: str, date_to: str) -> list[dict[str, Any]]:
+        """Лиды «доведён» и «в работе» за даты [from, to] (для итогов дня)."""
+        return await self.fetch_all(
+            "leads",
+            select="at,operator_id,group_id,status",
+            # at — текст «ГГГГ-ММ-ДДTЧЧ:ММ»: всё за date_to — это «меньше следующего дня»
+            params={"and": f"(at.gte.{date_from},at.lt.{(date.fromisoformat(date_to) + timedelta(days=1)).isoformat()})", "status": "in.(done,work)"},
+        )
+
+    async def day_shifts(self, date_from: str, date_to: str) -> list[dict[str, Any]]:
+        """Смены за даты [from, to] (для итогов дня: часы и кто завтра на смене)."""
+        return await self.fetch_all(
+            "shifts",
+            select="date,operator_id,hours,type",
+            params={"and": f"(date.gte.{date_from},date.lte.{date_to})"},
+        )
 
     async def load_reference(self) -> tuple[dict[str, Operator], dict[str, Group], dict[str, MonthPlan], Settings]:
         ops, groups, plans, kv = await asyncio.gather(

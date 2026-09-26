@@ -68,6 +68,8 @@ class Settings:
     workdays: list[int] = field(default_factory=lambda: [1, 2, 3, 4, 5])
     holidays: list[str] = field(default_factory=list)
     company_name: str = "Отдел лидогенерации"
+    # «Норма конверсии, %» из настроек CRM: лиды ÷ часы ниже нормы — красным
+    conv_norm_pct: float = 60
 
     @classmethod
     def from_json(cls, raw: dict[str, Any] | None) -> "Settings":
@@ -84,6 +86,7 @@ class Settings:
             workdays=[int(x) for x in workdays if isinstance(x, (int, float, str)) and str(x).isdigit()],
             holidays=[str(x) for x in holidays],
             company_name=str(raw.get("companyName") or "Отдел лидогенерации"),
+            conv_norm_pct=float(raw.get("convNormPct") or 60),
         )
 
 

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -17,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import messages
+from . import daily, messages
 from .config import Config
 from .db import SupabaseDB
 from .events import EventEngine, ReferenceData
@@ -62,11 +62,15 @@ class LeadupBot:
         self.app.add_handler(CommandHandler("connect", self.cmd_connect))
         self.app.add_handler(CommandHandler("status", self.cmd_status))
         self.app.add_handler(CommandHandler("test", self.cmd_test))
+        self.app.add_handler(CommandHandler("summary", self.cmd_summary))
         self.app.add_handler(ChatMemberHandler(self.on_chat_member, ChatMemberHandler.CHAT_MEMBER))
         self.app.add_handler(ChatMemberHandler(self.on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
         self.app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.on_new_members))
         self.monitor_task: asyncio.Task | None = None
         self.tag_task: asyncio.Task | None = None
+        self.daily_task: asyncio.Task | None = None
+        # день, за который итоги уже отправлены (или день был пустой) — чтобы не ходить в базу каждые 30 с
+        self._daily_done: str = ""
 
     def _admin_ok(self, update: Update) -> bool:
         if not self.cfg.admin_ids:
@@ -264,6 +268,81 @@ class LeadupBot:
             parse_mode=ParseMode.HTML,
         )
         await msg.reply_text("✅ Тестовое сообщение отправлено в подключенный чат.")
+
+    async def cmd_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Предпросмотр итогов дня прямо в этот чат (в рабочий чат ничего не уходит).
+        /summary — за сегодня, /summary 2026-09-26 — за дату."""
+        msg = update.effective_message
+        if not msg:
+            return
+        if not self._admin_ok(update):
+            await msg.reply_text("⛔ Недостаточно прав.")
+            return
+        day = context.args[0] if context.args else local_today(self.cfg.app_timezone)
+        try:
+            date.fromisoformat(day)
+        except ValueError:
+            await msg.reply_text("Дата — в формате ГГГГ-ММ-ДД, например /summary 2026-09-26")
+            return
+        summary = await self.build_daily_summary(day)
+        if summary is None:
+            await msg.reply_text("Бот ещё загружает данные — попробуйте через минуту.")
+            return
+        text = daily.render(summary)
+        if daily.is_quiet(summary):
+            text = "ℹ️ В этот день никто не работал — в рабочий чат итоги не отправляются.\n\n" + text
+        await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+    # ── итоги дня ──────────────────────────────────────────────────────────
+    async def build_daily_summary(self, day: str) -> daily.Summary | None:
+        if not self.ref:
+            return None
+        d = date.fromisoformat(day)
+        # лиды — с начала недели или месяца (что раньше); смены — там же и на завтра
+        start = min(d.replace(day=1), d - timedelta(days=d.weekday())).isoformat()
+        tomorrow = (d + timedelta(days=1)).isoformat()
+        lead_rows, shift_rows = await asyncio.gather(self.db.day_leads(start, day), self.db.day_shifts(start, tomorrow))
+        leads = [
+            daily.DayLead(str(r["at"]), str(r["operator_id"]), str(r["group_id"]) if r.get("group_id") is not None else None, str(r.get("status") or "work"))
+            for r in lead_rows
+        ]
+        shifts = [daily.DayShift(str(r["date"]), str(r["operator_id"]), float(r.get("hours") or 0), str(r.get("type") or "work")) for r in shift_rows]
+        ref = self.ref
+        return daily.build_summary(day, leads, shifts, ref.operators, ref.groups, ref.plans, ref.settings)
+
+    async def send_daily_summary(self, day: str) -> None:
+        if not self.engine or not await self._chat_id():
+            return
+        summary = await self.build_daily_summary(day)
+        if summary is None:
+            return
+        if daily.is_quiet(summary):
+            log.info("daily.summary.skipped day=%s reason=quiet", day)
+        else:
+            await self.engine.emit_once(
+                f"daily_summary:{day}", "daily_summary", daily.render(summary),
+                {"day": day, "leads": summary.leads, "pending": summary.pending, "hours": summary.hours},
+            )
+        self._daily_done = day
+
+    async def daily_summary_loop(self) -> None:
+        """Итоги дня в DAILY_SUMMARY_TIME по APP_TIMEZONE. Проверка каждые 30 с: после рестарта
+        в тот же вечер итоги догоняются, а ключ события не даёт отправить их дважды."""
+        at = self.cfg.daily_summary_at
+        if not at:
+            return
+        while True:
+            await asyncio.sleep(30)
+            try:
+                now = datetime.now(self.cfg.app_timezone)
+                day = now.date().isoformat()
+                if (now.hour, now.minute) < at or self._daily_done == day:
+                    continue
+                await self.send_daily_summary(day)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("daily.summary.failed; will retry")
 
     # ── участники рабочего чата ────────────────────────────────────────────
     async def _sync_member(self, chat_id: int, user_id: int, reason: str) -> None:
@@ -485,15 +564,17 @@ class LeadupBot:
         await self.bootstrap()
         self.monitor_task = asyncio.create_task(self.monitor(), name="leadup-monitor")
         self.tag_task = asyncio.create_task(self.tag_maintenance(), name="leadup-tags")
+        self.daily_task = asyncio.create_task(self.daily_summary_loop(), name="leadup-daily-summary")
         await application.bot.set_my_commands([
             ("start", "Что умеет Vexi"),
             ("link", "Привязать аккаунт LEADUP"),
             ("status", "Проверить подключение"),
             ("test", "Отправить тестовое достижение"),
+            ("summary", "Итоги дня — предпросмотр"),
         ])
 
     async def post_shutdown(self, application: Application) -> None:
-        for task in (self.monitor_task, self.tag_task):
+        for task in (self.monitor_task, self.tag_task, self.daily_task):
             if task:
                 task.cancel()
                 try:

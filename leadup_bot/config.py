@@ -47,6 +47,19 @@ def _tz(name: str, default: str) -> ZoneInfo:
         raise RuntimeError(f"Environment variable {name} must be an IANA timezone like Europe/Moscow, got: {raw}") from exc
 
 
+def _hhmm(name: str, default: str) -> tuple[int, int] | None:
+    raw = os.getenv(name, "").strip() or default
+    if raw.lower() in ("off", "0", "no", "false", "нет"):
+        return None
+    try:
+        h, m = (int(x) for x in raw.split(":", 1))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except ValueError as exc:
+        raise RuntimeError(f"Environment variable {name} must be HH:MM like 20:00 or off, got: {raw}") from exc
+    return h, m
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     telegram_token: str
@@ -65,6 +78,8 @@ class Config:
     tag_reconcile_interval: int
     # Как часто перепроверять теги прямо в Telegram (getChatMember), даже если в базе всё сходится.
     tag_verify_interval: int
+    # Итоги дня в рабочий чат: время «ЧЧ:ММ» по APP_TIMEZONE; None — выключено.
+    daily_summary_at: tuple[int, int] | None
 
     @classmethod
     def from_env(cls) -> Config:
@@ -81,4 +96,5 @@ class Config:
             bot_username=os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@"),
             tag_reconcile_interval=_int("TAG_RECONCILE_SECONDS", 300, minimum=30),
             tag_verify_interval=_int("TAG_VERIFY_SECONDS", 3600, minimum=300),
+            daily_summary_at=_hhmm("DAILY_SUMMARY_TIME", "20:00"),
         )

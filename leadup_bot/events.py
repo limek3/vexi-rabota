@@ -87,6 +87,10 @@ class EventEngine:
         # a future correct notification.
         return f"{EVENT_NAMESPACE}:{key}"
 
+    async def emit_once(self, key: str, typ: str, text: str, payload: dict) -> None:
+        """Отправить сообщение один раз на ключ (итоги дня и т. п.) — та же защита от повторов."""
+        await self._emit(key, typ, text, payload)
+
     async def _emit(self, key: str, typ: str, text: str, payload: dict) -> None:
         event_key = self._event_key(key)
         claimed = await self.db.claim_event(event_key, typ, payload)
