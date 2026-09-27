@@ -96,5 +96,5 @@ class Config:
             bot_username=os.getenv("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@"),
             tag_reconcile_interval=_int("TAG_RECONCILE_SECONDS", 300, minimum=30),
             tag_verify_interval=_int("TAG_VERIFY_SECONDS", 3600, minimum=300),
-            daily_summary_at=_hhmm("DAILY_SUMMARY_TIME", "20:00"),
+            daily_summary_at=_hhmm("DAILY_SUMMARY_TIME", "21:05"),
         )
