@@ -124,6 +124,15 @@ def _plural(n: int, forms: tuple[str, str, str]) -> str:
     return forms[2]
 
 
+def supervisor_ids(operators: dict[str, Operator], groups: dict[str, Group]) -> set[str]:
+    """Супервайзеры — как в LEADUP (lib/crm/calc.ts, supervisorIds): роль «Супервайзер» в карточке,
+    схема «оклад + бонус за объём группы» или руководитель группы. Их график не влияет на
+    показатели команды: в итогах дня нет их часов, строк «лучший» / «без лидов» и смен на завтра."""
+    out = {o.id for o in operators.values() if o.role == "supervisor" or o.pay_type == "sv_volume"}
+    out |= {g.supervisor_id for g in groups.values() if not g.deleted_at and g.supervisor_id}
+    return out
+
+
 def _team_day_plan(p: PlanResolver, settings: Settings, d: date) -> float:
     if not is_workday(d, settings):
         return 0.0
@@ -157,13 +166,15 @@ def build_summary(
         by_group_day[(lead.group_id, lead.day)] += 1
         by_day[lead.day] += 1
 
+    # часы — только операторов на линии: смены супервайзера в часы, конверсию и «завтра» не идут
+    sv = supervisor_ids(operators, groups)
     hours: dict[tuple[str, str], float] = defaultdict(float)
     for s in shifts:
-        if s.type in HOUR_TYPES and s.hours > 0:
+        if s.type in HOUR_TYPES and s.hours > 0 and s.operator_id not in sv:
             hours[(s.operator_id, s.date)] += s.hours
 
-    # люди дня: кто был на смене или передал лиды
-    worked = {op_id for (op_id, dd) in hours if dd == day} | {op_id for (op_id, dd) in by_op_day if dd == day}
+    # люди дня: кто был на смене или передал лиды (без супервайзеров — их лиды идут только в общий итог)
+    worked = ({op_id for (op_id, dd) in hours if dd == day} | {op_id for (op_id, dd) in by_op_day if dd == day}) - sv
     lines = [OpLine(operators[op_id], by_op_day.get((op_id, day), 0), hours.get((op_id, day), 0.0)) for op_id in worked if op_id in operators]
     with_leads = sorted((x for x in lines if x.leads > 0), key=lambda x: (-x.leads, x.hours, x.op.name))
     no_leads = sorted((x for x in lines if x.leads == 0 and x.hours > 0), key=lambda x: x.op.name)
@@ -246,14 +257,13 @@ def render(s: Summary) -> str:
         g_plan = math.ceil(gp - 1e-9) if gp > 0 else 0
         out.append(f"👥 {e(name)}: <b>{fact}</b>" + (f" при плане {g_plan}" if g_plan else ""))
 
-    # лучшие дня
+    # лучшие дня — первые три места
     if s.top:
         out.append("")
         best = s.top[0]
         out.append(f"🏆 Лучший оператор: <b>{e(short_name(best.op.name))}</b> — {_leads_for(best)}")
-        if len(s.top) > 1:
-            second = s.top[1]
-            out.append(f"👏 {e(short_name(second.op.name))} — {_leads_for(second)}")
+        for medal, x in zip(MEDALS[1:], s.top[1:3]):
+            out.append(f"{medal} {e(short_name(x.op.name))} — {_leads_for(x)}")
 
     # без лидов
     if s.no_leads:

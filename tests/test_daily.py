@@ -93,10 +93,46 @@ def test_render_format():
     assert text.startswith("📊 <b>Итоги дня · пт, 25 сентября</b>\nГруппа 1\n")
     assert "⏳ Ещё на проверке: 1 лид" in text
     assert "🏆 Лучший оператор: <b>Комиссарова В.</b> — 8 лидов за 7,5 ч" in text
-    assert "👏 Шумаков И. — 5 лидов за 10 ч" in text
+    assert "🥈 Шумаков И. — 5 лидов за 10 ч" in text
     assert "⚠️ <b>Без лидов:</b> Ализаде Р. — 6 ч на смене" in text
     assert "📅 <b>Неделя</b> (21–27.09):" in text
     assert "Завтра на смене: Диникаев А. (12 ч)" in text
+
+
+def test_top_three_places():
+    s = summary(extra_leads=leads("a", 3))
+    assert [x.op.id for x in s.top] == ["k", "s", "a"]
+    text = render(s)
+    assert "🏆 Лучший оператор: <b>Комиссарова В.</b>" in text
+    assert "🥈 Шумаков И. — 5 лидов за 10 ч" in text
+    assert "🥉 Ализаде Р. — 3 лида за 6 ч" in text
+
+
+def test_supervisors_not_in_day_summary():
+    # супервайзер по роли, по схеме «оклад + бонус за объём группы» и руководитель группы
+    ops = dict(
+        OPS,
+        sv=Operator(id="sv", name="Чудаева Юлия", group_id="g1", status="active", hire_date="2026-09-01", fire_date="", monthly_plan=None, deleted_at=None, role="supervisor"),
+        vol=Operator(id="vol", name="Объёмов Иван", group_id="g1", status="active", hire_date="2026-09-01", fire_date="", monthly_plan=None, deleted_at=None, pay_type="sv_volume"),
+        lead=op("lead", "Руководов Пётр"),
+    )
+    groups = {"g1": Group(id="g1", name="Группа 1", monthly_plan=0, active=True, deleted_at=None, supervisor_id="lead")}
+    ls = leads("k", 8) + leads("sv", 2)
+    sh = [
+        DayShift(DAY, "k", 7.5, "work"),
+        DayShift(DAY, "sv", 8, "work"),
+        DayShift(DAY, "vol", 8, "work"),
+        DayShift(DAY, "lead", 8, "work"),
+        DayShift("2026-09-26", "sv", 8, "work"),
+        DayShift("2026-09-26", "d", 12, "work"),
+    ]
+    s = build_summary(DAY, ls, sh, ops, groups, {}, SETTINGS)
+    assert s.leads == 10  # лиды супервайзера — в общем итоге
+    assert s.hours == 7.5  # часы — только операторов на линии
+    assert [x.op.id for x in s.top] == ["k"]
+    assert s.no_leads == []  # супервайзеры без лидов — не «без лидов»
+    assert [x.op.id for x in s.tomorrow] == ["d"]
+    assert "Чудаева" not in render(s)
 
 
 def test_plan_missed_is_marked():

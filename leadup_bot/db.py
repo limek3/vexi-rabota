@@ -116,8 +116,8 @@ class SupabaseDB:
 
     async def load_reference(self) -> tuple[dict[str, Operator], dict[str, Group], dict[str, MonthPlan], Settings]:
         ops, groups, plans, kv = await asyncio.gather(
-            self.fetch_all("operators", select="id,name,group_id,status,hire_date,fire_date,monthly_plan,deleted_at"),
-            self.fetch_all("groups", select="id,name,monthly_plan,active,deleted_at"),
+            self.fetch_all("operators", select="id,name,group_id,status,hire_date,fire_date,monthly_plan,deleted_at,role,pay_type"),
+            self.fetch_all("groups", select="id,name,monthly_plan,active,deleted_at,supervisor_id"),
             self.fetch_all("plans", select="id,month,scope,target_id,plan"),
             self.fetch_all("kv", select="key,value", params={"key": "eq.settings"}),
         )
@@ -129,6 +129,7 @@ class SupabaseDB:
                 fire_date=str(r.get("fire_date") or ""),
                 monthly_plan=(float(r["monthly_plan"]) if r.get("monthly_plan") is not None else None),
                 deleted_at=(str(r["deleted_at"]) if r.get("deleted_at") is not None else None),
+                role=str(r.get("role") or "operator"), pay_type=str(r.get("pay_type") or ""),
             ) for r in ops
         }
         group_map = {
@@ -136,6 +137,7 @@ class SupabaseDB:
                 id=str(r["id"]), name=str(r.get("name") or "Без названия"),
                 monthly_plan=float(r.get("monthly_plan") or 0), active=bool(r.get("active", True)),
                 deleted_at=(str(r["deleted_at"]) if r.get("deleted_at") is not None else None),
+                supervisor_id=(str(r["supervisor_id"]) if r.get("supervisor_id") is not None else None),
             ) for r in groups
         }
         plan_map = {

@@ -41,6 +41,9 @@ class Operator:
     fire_date: str
     monthly_plan: float | None
     deleted_at: str | None
+    # роль в карточке и схема оплаты — по ним видно супервайзера (см. daily.supervisor_ids)
+    role: str = "operator"
+    pay_type: str = ""
 
 
 @dataclass(slots=True)
@@ -50,6 +53,8 @@ class Group:
     monthly_plan: float
     active: bool
     deleted_at: str | None
+    # руководитель группы (карточка сотрудника) — тоже супервайзер
+    supervisor_id: str | None = None
 
 
 @dataclass(slots=True)
