@@ -106,6 +106,24 @@ def daily_plan(name: str, fact: int, daily_plan_value: float, who: str | None = 
     )
 
 
+def group_day_plan(group_name: str, fact: int, plan: float) -> str:
+    target = math.ceil(plan - 1e-9)
+    return (
+        "✅ <b>ГРУППА ЗАКРЫЛА ПЛАН ДНЯ</b>\n\n"
+        f"Группа «{e(group_name)}» выполнила дневной план.\n\n"
+        f"<blockquote>Результат: {fact} / {target} {plural_leads(target)}</blockquote>"
+    )
+
+
+def team_day_plan(company: str, fact: int, plan: float) -> str:
+    target = math.ceil(plan - 1e-9)
+    return (
+        "🏁 <b>ПЛАН ДНЯ ОТДЕЛА ВЫПОЛНЕН</b>\n\n"
+        f"{e(company)} закрывает дневной план.\n\n"
+        f"<blockquote>Результат: {fact} / {target} {plural_leads(target)}</blockquote>"
+    )
+
+
 def _month_left(day: str) -> tuple[bool, str]:
     """Досрочно ли (не последний день месяца) и строка «До конца месяца: N дн.»."""
     d = date.fromisoformat(day)

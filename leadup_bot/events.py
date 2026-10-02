@@ -117,6 +117,9 @@ class EventEngine:
             except Exception:
                 log.exception("Operator change hook failed for %s", op_id)
 
+    def _many_groups(self) -> bool:
+        return sum(1 for g in self.ref.groups.values() if not g.deleted_at) > 1
+
     async def process_lead_change(self, lead: Lead) -> None:
         # Re-evaluate even when this exact row is retried after a transient error.
         # Event keys make the operation idempotent, while this prevents a failed Telegram
@@ -182,6 +185,16 @@ class EventEngine:
                     {"group_id": group.id, "group_name": group.name, "month": month, "fact": gm, "plan": gp, "day": day},
                 )
 
+            # 5b) Group day plan — only when there are several groups, otherwise it repeats the team message.
+            if group and self._many_groups():
+                gdp = self.plans.group_daily_plan(lead.group_id, day)
+                gd = self.cache.group_day_count(lead.group_id, day)
+                if gdp > 0 and gd >= math.ceil(gdp - 1e-9):
+                    await self._emit(
+                        f"day_plan:group:{day}:{group.id}", "day_plan_group", messages.group_day_plan(group.name, gd, gdp),
+                        {"group_id": group.id, "group_name": group.name, "day": day, "fact": gd, "plan": gdp},
+                    )
+
             # 6) Group day record. Need an existing historical record, otherwise a group's first working day isn't announced as a record.
             current_group = self.cache.group_day_count(lead.group_id, day)
             previous_group = self.cache.group_previous_record(lead.group_id, day)
@@ -198,6 +211,15 @@ class EventEngine:
             await self._emit(
                 f"month_plan:team:{month}", "month_plan_team", messages.team_month_plan(self.ref.settings.company_name, tm, tp, day),
                 {"month": month, "fact": tm, "plan": tp, "day": day},
+            )
+
+        # 7b) Team day plan: month plan / workdays, same as the daily summary.
+        tdp = self.plans.team_daily_plan(day)
+        td = self.cache.team_day_count(day)
+        if tdp > 0 and td >= math.ceil(tdp - 1e-9):
+            await self._emit(
+                f"day_plan:team:{day}", "day_plan_team", messages.team_day_plan(self.ref.settings.company_name, td, tdp),
+                {"day": day, "fact": td, "plan": tdp},
             )
 
         # 8) Team day record.
@@ -257,6 +279,12 @@ class EventEngine:
                     {"group_id": group.id, "group_name": group.name, "month": month, "fact": gm, "plan": gp, "day": day, "reconciled": True},
                 )
             current_group = self.cache.group_day_count(group.id, day)
+            gdp = p.group_daily_plan(group.id, day)
+            if self._many_groups() and gdp > 0 and current_group >= math.ceil(gdp - 1e-9):
+                await self._emit(
+                    f"day_plan:group:{day}:{group.id}", "day_plan_group", messages.group_day_plan(group.name, current_group, gdp),
+                    {"group_id": group.id, "group_name": group.name, "day": day, "fact": current_group, "plan": gdp, "reconciled": True},
+                )
             previous_group = self.cache.group_previous_record(group.id, day)
             if previous_group > 0 and current_group > previous_group:
                 await self._emit(
@@ -272,6 +300,12 @@ class EventEngine:
                 {"month": month, "fact": tm, "plan": tp, "day": day, "reconciled": True},
             )
         current_team = self.cache.team_day_count(day)
+        tdp = p.team_daily_plan(day)
+        if tdp > 0 and current_team >= math.ceil(tdp - 1e-9):
+            await self._emit(
+                f"day_plan:team:{day}", "day_plan_team", messages.team_day_plan(self.ref.settings.company_name, current_team, tdp),
+                {"day": day, "fact": current_team, "plan": tdp, "reconciled": True},
+            )
         previous_team = self.cache.team_previous_record(day)
         if previous_team > 0 and current_team > previous_team:
             await self._emit(
@@ -319,7 +353,14 @@ class EventEngine:
             prev = self.cache.group_previous_record(group_id, day)
             if prev > 0 and count > prev:
                 out.append((f"group_record:{day}:{group_id}", "group_record", {"seeded": True}))
+        for (group_id, day), count in list(self.cache.group_day.items()):
+            gdp = p.group_daily_plan(group_id, day) if group_id != "__none__" else 0
+            if gdp > 0 and count >= math.ceil(gdp - 1e-9):
+                out.append((f"day_plan:group:{day}:{group_id}", "day_plan_group", {"seeded": True}))
         for day, count in list(self.cache.team_day.items()):
+            tdp = p.team_daily_plan(day)
+            if tdp > 0 and count >= math.ceil(tdp - 1e-9):
+                out.append((f"day_plan:team:{day}", "day_plan_team", {"seeded": True}))
             prev = self.cache.team_previous_record(day)
             if prev > 0 and count > prev:
                 out.append((f"team_record:{day}", "team_record", {"seeded": True}))

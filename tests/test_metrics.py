@@ -71,3 +71,16 @@ def test_grade_counts_are_separate_for_each_day():
     c.load(leads)
     assert c.op_day_count("op1", "2026-09-22") == 11
     assert c.op_day_count("op1", "2026-09-23") == 6
+
+
+def test_team_and_group_daily_plan():
+    # октябрь 2026, пн–пт: 22 рабочих дня → 880 / 22 = 40 в день; в воскресенье плана нет
+    r = PlanResolver(
+        {},
+        {"g1": Group("g1", "Авто", 440, True, None)},
+        {"2026-10|team": MonthPlan("2026-10|team", "2026-10", "team", None, 880)},
+        Settings(),
+    )
+    assert r.team_daily_plan("2026-10-02") == 40
+    assert r.group_daily_plan("g1", "2026-10-02") == 20
+    assert r.team_daily_plan("2026-10-04") == 0

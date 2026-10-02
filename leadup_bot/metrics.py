@@ -169,6 +169,19 @@ class PlanResolver:
         wd = sum(1 for x in work if win[0] <= x <= win[1])
         return plan / wd if wd else 0
 
+    def team_daily_plan(self, day: str) -> float:
+        """План дня отдела — как в «Итогах дня»: план месяца ÷ рабочие дни; в нерабочий день 0."""
+        if not is_workday(parse_day(day), self.settings):
+            return 0.0
+        month = day[:7]
+        return self.team_plan(month) / max(1, len(effective_workdays(month, self.settings)))
+
+    def group_daily_plan(self, group_id: str | None, day: str) -> float:
+        if not is_workday(parse_day(day), self.settings):
+            return 0.0
+        month = day[:7]
+        return self.group_plan(group_id, month) / max(1, len(effective_workdays(month, self.settings)))
+
     def group_plan(self, group_id: str | None, month: str) -> float:
         if group_id is None:
             return sum(self.operator_plan(o, month) for o in self.operators.values() if o.group_id is None and not o.deleted_at)
