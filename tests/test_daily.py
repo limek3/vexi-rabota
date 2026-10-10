@@ -138,3 +138,23 @@ def test_supervisors_not_in_day_summary():
 def test_plan_missed_is_marked():
     s = build_summary(DAY, leads("k", 3), [DayShift(DAY, "k", 8, "work")], OPS, GROUPS, {}, SETTINGS)
     assert "Лиды: <b>3</b> при плане 7 — <b>44%</b> ⚠️" in render(s)
+
+
+def test_fired_not_on_shift_after_fire_date():
+    # уволен 24-го: его смены 25-го и завтра остались в графике — в итогах их нет
+    gone = Operator(id="g", name="Ушедший Олег", group_id="g1", status="fired", hire_date="2026-09-01", fire_date="2026-09-24", monthly_plan=None, deleted_at=None)
+    last = Operator(id="l", name="Последний Лев", group_id="g1", status="fired", hire_date="2026-09-01", fire_date=DAY, monthly_plan=None, deleted_at=None)
+    ops = dict(OPS, g=gone, l=last)
+    sh = [
+        DayShift(DAY, "k", 7.5, "work"),
+        DayShift(DAY, "g", 8, "work"),
+        DayShift(DAY, "l", 8, "work"),
+        DayShift("2026-09-26", "g", 8, "work"),
+        DayShift("2026-09-26", "l", 8, "work"),
+        DayShift("2026-09-26", "d", 12, "work"),
+    ]
+    s = build_summary(DAY, leads("k", 8), sh, ops, GROUPS, {}, SETTINGS)
+    assert s.hours == 15.5  # день увольнения — ещё рабочий, после — нет
+    assert [x.op.id for x in s.no_leads] == ["l"]
+    assert [x.op.id for x in s.tomorrow] == ["d"]
+    assert "Ушедший" not in render(s)

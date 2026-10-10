@@ -133,6 +133,18 @@ def supervisor_ids(operators: dict[str, Operator], groups: dict[str, Group]) -> 
     return out
 
 
+def gone_on(op: Operator | None, day: str) -> bool:
+    """Уволен к этому дню — как в LEADUP: дата увольнения — последний рабочий день, смены после неё
+    не считаются (в графике там «уволен»). Удалённая карточка или «уволен» без даты — не работает вовсе."""
+    if op is None:
+        return True
+    if op.deleted_at:
+        return True
+    if op.status != "fired":
+        return False
+    return not op.fire_date or day > op.fire_date
+
+
 def _team_day_plan(p: PlanResolver, settings: Settings, d: date) -> float:
     if not is_workday(d, settings):
         return 0.0
@@ -170,7 +182,7 @@ def build_summary(
     sv = supervisor_ids(operators, groups)
     hours: dict[tuple[str, str], float] = defaultdict(float)
     for s in shifts:
-        if s.type in HOUR_TYPES and s.hours > 0 and s.operator_id not in sv:
+        if s.type in HOUR_TYPES and s.hours > 0 and s.operator_id not in sv and not gone_on(operators.get(s.operator_id), s.date):
             hours[(s.operator_id, s.date)] += s.hours
 
     # люди дня: кто был на смене или передал лиды (без супервайзеров — их лиды идут только в общий итог)
@@ -203,7 +215,7 @@ def build_summary(
     month_fact = sum(n for dd, n in by_day.items() if dd.startswith(month))
 
     tomorrow_lines = sorted(
-        (OpLine(operators[op_id], 0, h) for (op_id, dd), h in hours.items() if dd == tomorrow and op_id in operators and not operators[op_id].deleted_at),
+        (OpLine(operators[op_id], 0, h) for (op_id, dd), h in hours.items() if dd == tomorrow and op_id in operators),
         key=lambda x: x.op.name,
     )
 
