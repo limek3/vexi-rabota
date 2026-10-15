@@ -7,12 +7,14 @@ from datetime import date
 from typing import Awaitable, Callable
 
 from . import messages
+from .chats import TEAM, Target, group_target
 from .db import SupabaseDB
 from .metrics import MetricsCache, PlanResolver
 from .models import Group, Lead, MonthPlan, Operator, Settings
 
 log = logging.getLogger(__name__)
-Send = Callable[[str], Awaitable[None]]
+# Отправка: текст и куда — чат команды оператора/группы или все чаты отдела (chats.Target).
+Send = Callable[[str, Target], Awaitable[None]]
 # Вызывается при любом изменении лида для затронутых операторов — до поздравлений,
 # чтобы тег в чате сменился раньше, чем придёт сообщение о новом грейде.
 OperatorHook = Callable[[str], Awaitable[None]]
@@ -87,17 +89,28 @@ class EventEngine:
         # a future correct notification.
         return f"{EVENT_NAMESPACE}:{key}"
 
-    async def emit_once(self, key: str, typ: str, text: str, payload: dict) -> None:
+    async def emit_once(self, key: str, typ: str, text: str, payload: dict, target: Target | None = None) -> None:
         """Отправить сообщение один раз на ключ (итоги дня и т. п.) — та же защита от повторов."""
-        await self._emit(key, typ, text, payload)
+        await self._emit(key, typ, text, payload, target)
 
-    async def _emit(self, key: str, typ: str, text: str, payload: dict) -> None:
+    def target_of(self, payload: dict) -> Target:
+        """Куда событие: про оператора — в чат его команды (группа в карточке сейчас, иначе группа лида),
+        про группу — в чат группы, про весь отдел — во все чаты."""
+        op_id = payload.get("operator_id")
+        if op_id:
+            op = self.ref.operators.get(str(op_id))
+            return group_target((op.group_id if op else None) or payload.get("group_id"))
+        if payload.get("group_id"):
+            return group_target(str(payload["group_id"]))
+        return TEAM
+
+    async def _emit(self, key: str, typ: str, text: str, payload: dict, target: Target | None = None) -> None:
         event_key = self._event_key(key)
         claimed = await self.db.claim_event(event_key, typ, payload)
         if not claimed:
             return
         try:
-            await self.sender(text)
+            await self.sender(text, target or self.target_of(payload))
             log.info("Sent event %s", event_key)
         except Exception:
             await self.db.release_event(event_key)

@@ -49,6 +49,8 @@ class DayShift:
     operator_id: str
     hours: float
     type: str
+    # группа оператора на день смены (shifts.group_id); нет — берём группу из карточки
+    group_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -160,12 +162,34 @@ def build_summary(
     groups: dict[str, Group],
     plans: dict[str, MonthPlan],
     settings: Settings,
+    group_id: str | None = None,
 ) -> Summary:
-    """leads — с начала недели или месяца (что раньше) по день включительно; shifts — там же + завтра."""
+    """leads — с начала недели или месяца (что раньше) по день включительно; shifts — там же + завтра.
+
+    group_id — итоги одной команды для её чата: лиды группы (по группе на момент передачи), смены её
+    людей, планы группы. Без него — весь отдел."""
     p = PlanResolver(operators, groups, plans, settings)
     d = date.fromisoformat(day)
     month = day[:7]
     tomorrow = (d + timedelta(days=1)).isoformat()
+
+    if group_id:
+        def shift_group(s: DayShift) -> str | None:
+            op = operators.get(s.operator_id)
+            return s.group_id or (op.group_id if op else None)
+
+        leads = [x for x in leads if x.group_id == group_id]
+        shifts = [s for s in shifts if shift_group(s) == group_id]
+
+        def day_plan_of(x: date) -> float:
+            return p.group_daily_plan(group_id, x.isoformat())
+
+        month_plan = p.group_plan(group_id, month)
+    else:
+        def day_plan_of(x: date) -> float:
+            return _team_day_plan(p, settings, x)
+
+        month_plan = p.team_plan(month)
 
     by_op_day: dict[tuple[str, str], int] = defaultdict(int)
     by_group_day: dict[tuple[str | None, str], int] = defaultdict(int)
@@ -194,7 +218,7 @@ def build_summary(
     # группы: только если их несколько — иначе строка повторяет итог отдела
     live_groups = [g for g in groups.values() if not g.deleted_at]
     group_lines: list[tuple[str, int, float]] = []
-    if len(live_groups) > 1:
+    if len(live_groups) > 1 and not group_id:
         work = effective_workdays(month, settings)
         for g in sorted(live_groups, key=lambda x: x.name):
             fact = by_group_day.get((g.id, day), 0)
@@ -206,9 +230,8 @@ def build_summary(
     week_start = d - timedelta(days=d.weekday())
     week_days = [week_start + timedelta(days=i) for i in range(7)]
     week_fact = sum(by_day.get(x.isoformat(), 0) for x in week_days if x <= d)
-    week_plan = sum(_team_day_plan(p, settings, x) for x in week_days)
+    week_plan = sum(day_plan_of(x) for x in week_days)
 
-    month_plan = p.team_plan(month)
     work_days = effective_workdays(month, settings)
     passed = sum(1 for x in work_days if x <= d)
     plan_to_date = month_plan * passed / max(1, len(work_days))
@@ -221,12 +244,15 @@ def build_summary(
 
     return Summary(
         day=day,
-        # подпись под заголовком: одна группа — её название, иначе — название отдела
-        company=live_groups[0].name if len(live_groups) == 1 else settings.company_name,
+        # подпись под заголовком: итоги команды или одна группа — её название, иначе — название отдела
+        company=(
+            groups[group_id].name if group_id and group_id in groups
+            else live_groups[0].name if len(live_groups) == 1 else settings.company_name
+        ),
         leads=by_day.get(day, 0),
         pending=pending,
         hours=sum(h for (_, dd), h in hours.items() if dd == day),
-        day_plan=_team_day_plan(p, settings, d),
+        day_plan=day_plan_of(d),
         conv_norm=settings.conv_norm_pct / 100,
         top=with_leads[:3],
         no_leads=no_leads,

@@ -6,10 +6,11 @@ import re
 import secrets
 from datetime import date, datetime, timedelta, timezone
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
@@ -18,6 +19,7 @@ from telegram.ext import (
 )
 
 from . import daily, messages
+from .chats import Chats, Target, chat_target
 from .config import Config
 from .db import SupabaseDB
 from .events import EventEngine, ReferenceData
@@ -33,6 +35,9 @@ LINK_PAYLOAD = re.compile(r"^link_([0-9]{6})$")
 CHAT_ID_TTL = 30.0
 TAG_TICK_SECONDS = 15
 RIGHTS_ALERT_REPEAT = timedelta(hours=24)
+# сколько живёт выбор команды после /connect (кнопки под сообщением)
+CONNECT_PICK_SECONDS = 600.0
+CONNECT_MAIN = "main"
 
 
 def mask_code(code: str) -> str:
@@ -49,7 +54,9 @@ class LeadupBot:
         self.engine: EventEngine | None = None
         self.tag_sync: TagSync | None = None
         self.bot_username: str = cfg.bot_username
-        self._chat_cache: tuple[int | None, float] | None = None
+        self._chat_cache: tuple[Chats, float] | None = None
+        # /connect с выбором команды: чат → (кто запустил, когда); выбрать кнопкой может только он
+        self._pending_connect: dict[int, tuple[int, float]] = {}
         self.app = (
             Application.builder()
             .token(cfg.telegram_token)
@@ -63,6 +70,7 @@ class LeadupBot:
         self.app.add_handler(CommandHandler("status", self.cmd_status))
         self.app.add_handler(CommandHandler("test", self.cmd_test))
         self.app.add_handler(CommandHandler("summary", self.cmd_summary))
+        self.app.add_handler(CallbackQueryHandler(self.on_connect_pick, pattern=r"^connect:"))
         self.app.add_handler(ChatMemberHandler(self.on_chat_member, ChatMemberHandler.CHAT_MEMBER))
         self.app.add_handler(ChatMemberHandler(self.on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
         self.app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.on_new_members))
@@ -78,14 +86,31 @@ class LeadupBot:
         uid = update.effective_user.id if update.effective_user else None
         return uid in self.cfg.admin_ids
 
-    async def _chat_id(self) -> int | None:
-        """ID рабочего чата с коротким кэшем: тег проверяется на каждое изменение лида."""
+    async def _chats(self, *, force: bool = False) -> Chats:
+        """Рабочие чаты (общий и команд) с коротким кэшем: тег проверяется на каждое изменение лида."""
         now = asyncio.get_running_loop().time()
-        if self._chat_cache and now - self._chat_cache[1] < CHAT_ID_TTL:
+        if not force and self._chat_cache and now - self._chat_cache[1] < CHAT_ID_TTL:
             return self._chat_cache[0]
-        chat_id = await self.db.get_chat_id()
-        self._chat_cache = (chat_id, now)
-        return chat_id
+        chats = await self.db.load_chats()
+        self._chat_cache = (chats, now)
+        return chats
+
+    async def _chat_for_operator(self, operator_id: str) -> int | None:
+        """Чат, где стоит тег оператора: чат его команды, без него — общий чат отдела."""
+        op = self.ref.operators.get(operator_id) if self.ref else None
+        return (await self._chats()).for_group(op.group_id if op else None)
+
+    def _live_groups(self) -> list:
+        groups = self.ref.groups.values() if self.ref else []
+        return sorted((g for g in groups if not g.deleted_at), key=lambda g: g.name)
+
+    def _place(self, chats: Chats, chat_id: int) -> str:
+        """Как подключён чат: «команда «Группа 1»», «общий чат отдела» или ''."""
+        gid = chats.group_of(chat_id)
+        if gid:
+            g = self.ref.groups.get(gid) if self.ref else None
+            return f"команда «{g.name if g else gid}»"
+        return "общий чат отдела" if chats.main == chat_id else ""
 
     # ── команды ────────────────────────────────────────────────────────────
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -108,7 +133,8 @@ class LeadupBot:
             "Привяжите свой аккаунт LEADUP — и я буду ставить ваш дневной грейд тегом в рабочем чате:\n"
             "<code>/link КОД</code> (код — в LEADUP, блок Telegram)\n\n"
             "Для подключения рабочего чата добавь меня в группу и выполни:\n"
-            "<code>/connect ТВОЙ_СЕКРЕТ</code>",
+            "<code>/connect ТВОЙ_СЕКРЕТ</code> — я спрошу, какой команды этот чат.\n"
+            "У каждой команды — свой чат: туда приходят её грейды, рекорды и планы.",
             parse_mode=ParseMode.HTML,
         )
 
@@ -186,23 +212,84 @@ class LeadupBot:
         if chat.type not in ("group", "supergroup"):
             await msg.reply_text("Добавь меня в рабочую группу и выполни команду /connect там.")
             return
-        await self.db.set_chat_id(chat.id)
-        self._chat_cache = (chat.id, asyncio.get_running_loop().time())
+        groups = self._live_groups()
+        # /connect СЕКРЕТ Группа 2 — сразу к команде; «отдел» / «общий» — общим чатом
+        wanted = " ".join(context.args[1:]).strip().lower()
+        if wanted:
+            if wanted in ("отдел", "общий", "все", "всё", "весь отдел"):
+                await self._connect(chat.id, None, msg.reply_text)
+                return
+            g = next((x for x in groups if x.name.strip().lower() == wanted), None)
+            if not g:
+                names = ", ".join(f"«{x.name}»" for x in groups) or "—"
+                await msg.reply_text(f"Не нашёл команду «{' '.join(context.args[1:])}». В LEADUP есть: {names}.")
+                return
+            await self._connect(chat.id, g.id, msg.reply_text)
+            return
+        # одна группа (или групп нет) — как раньше: общий чат отдела
+        if len(groups) <= 1:
+            await self._connect(chat.id, None, msg.reply_text)
+            return
+        user_id = update.effective_user.id if update.effective_user else 0
+        self._pending_connect[chat.id] = (user_id, asyncio.get_running_loop().time())
+        buttons = [[InlineKeyboardButton(g.name, callback_data=f"connect:{g.id}")] for g in groups]
+        buttons.append([InlineKeyboardButton("Весь отдел — общий чат", callback_data=f"connect:{CONNECT_MAIN}")])
+        await msg.reply_text(
+            "🔗 <b>Какой команды этот чат?</b>\n\n"
+            "Грейды, рекорды и планы операторов будут приходить в чат их команды, "
+            "события всего отдела — во все чаты.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def on_connect_pick(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Кнопка выбора команды после /connect. Нажать может только тот, кто запускал /connect."""
+        q = update.callback_query
+        if not q or not q.message:
+            return
+        chat_id = q.message.chat.id
+        pending = self._pending_connect.get(chat_id)
+        fresh = pending and asyncio.get_running_loop().time() - pending[1] < CONNECT_PICK_SECONDS
+        if not pending or not fresh or (pending[0] and q.from_user.id != pending[0]):
+            await q.answer("Выбрать может тот, кто запускал /connect. Если прошло больше 10 минут — запустите заново.", show_alert=True)
+            return
+        value = (q.data or "").split(":", 1)[1]
+        group_id = None if value == CONNECT_MAIN else value
+        if group_id and not any(g.id == group_id for g in self._live_groups()):
+            await q.answer("Такой команды в LEADUP уже нет — запустите /connect заново.", show_alert=True)
+            return
+        self._pending_connect.pop(chat_id, None)
+        await q.answer()
+
+        async def reply(text: str, **kw: object) -> None:
+            await q.edit_message_text(text, **kw)  # type: ignore[arg-type]
+
+        await self._connect(chat_id, group_id, reply)
+
+    async def _connect(self, chat_id: int, group_id: str | None, reply) -> None:  # noqa: ANN001
+        chats = await self.db.connect_chat(chat_id, group_id)
+        self._chat_cache = (chats, asyncio.get_running_loop().time())
         rights_line = ""
         if self.tag_sync:
-            self.tag_sync.invalidate_rights()
-            rights = await self.tag_sync.rights(chat.id, force=True)
+            self.tag_sync.invalidate_rights(chat_id)
+            rights = await self.tag_sync.rights(chat_id, force=True)
             rights_line = f"\nУправление тегами: {messages.RIGHTS_LABELS.get(rights, rights)}"
-        await msg.reply_text(
-            "✅ <b>ЧАТ ПОДКЛЮЧЕН</b>\n\n"
-            "Vexi теперь связан с LEADUP.\n"
+        place = self._place(chats, chat_id)
+        what = (
+            "Сюда будут приходить грейды, рекорды и планы операторов этой команды, а также события всего отдела."
+            if group_id else
             "Новые достижения будут появляться здесь автоматически."
+        )
+        await reply(
+            "✅ <b>ЧАТ ПОДКЛЮЧЕН</b>\n\n"
+            f"Vexi связан с LEADUP: {place}.\n"
+            f"{what}"
             f"{rights_line}",
             parse_mode=ParseMode.HTML,
         )
-        log.info("Telegram chat connected: %s", chat.id)
+        log.info("Telegram chat connected: chat_id=%s group_id=%s", chat_id, group_id or "-")
         if self.tag_sync:
-            # привязки, сделанные до подключения чата, получают теги сейчас
+            # теги переезжают в чаты команд; привязки, сделанные до подключения, получают теги сейчас
             await self.tag_sync.reconcile_all("connect", verify=True)
         if self.engine and self.cache.team_day:
             try:
@@ -223,20 +310,23 @@ class LeadupBot:
             log.exception("Status failed")
             await msg.reply_text(f"🔴 Ошибка подключения к базе: <code>{type(exc).__name__}</code>", parse_mode=ParseMode.HTML)
             return
-        chat_id = await self.db.get_chat_id()
-        self._chat_cache = (chat_id, asyncio.get_running_loop().time())
-        lines = [
-            "🟢 <b>VEXI BOT · ONLINE</b>\n",
-            f"Telegram чат: {'подключен' if chat_id else 'не подключен'}",
-            "Supabase: подключен",
-        ]
+        chats = await self._chats(force=True)
+        here = update.effective_chat.id if update.effective_chat else 0
+        lines = ["🟢 <b>VEXI BOT · ONLINE</b>\n", "Supabase: подключен"]
+        # куда что приходит: общий чат и чат каждой команды
+        mark = lambda c: " — этот чат" if c == here else ""  # noqa: E731
+        lines.append(f"Общий чат отдела: {'подключен' + mark(chats.main) if chats.main else 'не подключен'}")
+        for g in self._live_groups():
+            c = chats.groups.get(g.id)
+            lines.append(f"Команда «{messages.e(g.name)}»: " + (f"свой чат{mark(c)}" if c else "общий чат" if chats.main else "не подключена"))
         rights = None
         if not self.tag_sync:
             lines.append("Управление тегами: выключено — не выполнена миграция привязки Telegram")
         else:
-            if chat_id:
-                rights = await self.tag_sync.rights(chat_id, force=True)
-                lines.append(f"Управление тегами: {messages.RIGHTS_LABELS.get(rights, rights)}")
+            target = here if here in chats.all() else (chats.all()[0] if chats.any() else None)
+            if target:
+                rights = await self.tag_sync.rights(target, force=True)
+                lines.append(f"Управление тегами{' здесь' if target == here else ''}: {messages.RIGHTS_LABELS.get(rights, rights)}")
             else:
                 lines.append("Управление тегами: сначала подключите чат через /connect")
             links = self.tag_sync.links.values()
@@ -258,7 +348,10 @@ class LeadupBot:
         if not self._admin_ok(update):
             await msg.reply_text("⛔ Недостаточно прав.")
             return
-        chat_id = await self.db.get_chat_id()
+        chats = await self._chats(force=True)
+        here = update.effective_chat.id if update.effective_chat else 0
+        # в этот чат, если он рабочий; из лички — в общий чат (или первый чат команды)
+        chat_id = here if here in chats.all() else (chats.main or (chats.all()[0] if chats.any() else None))
         if not chat_id:
             await msg.reply_text("Сначала подключи рабочий чат через /connect.")
             return
@@ -267,7 +360,7 @@ class LeadupBot:
             text=messages.grade("Тестовый оператор", 6),
             parse_mode=ParseMode.HTML,
         )
-        await msg.reply_text("✅ Тестовое сообщение отправлено в подключенный чат.")
+        await msg.reply_text(f"✅ Тестовое сообщение отправлено: {self._place(chats, chat_id)}.")
 
     async def cmd_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Предпросмотр итогов дня прямо в этот чат (в рабочий чат ничего не уходит).
@@ -284,7 +377,9 @@ class LeadupBot:
         except ValueError:
             await msg.reply_text("Дата — в формате ГГГГ-ММ-ДД, например /summary 2026-09-26")
             return
-        summary = await self.build_daily_summary(day)
+        # в чате команды — итоги этой команды, в общем чате и в личке — всего отдела
+        here = update.effective_chat.id if update.effective_chat else 0
+        summary = await self.build_daily_summary(day, (await self._chats()).group_of(here))
         if summary is None:
             await msg.reply_text("Бот ещё загружает данные — попробуйте через минуту.")
             return
@@ -294,7 +389,8 @@ class LeadupBot:
         await msg.reply_text(text, parse_mode=ParseMode.HTML)
 
     # ── итоги дня ──────────────────────────────────────────────────────────
-    async def build_daily_summary(self, day: str) -> daily.Summary | None:
+    async def build_daily_summary(self, day: str, group_id: str | None = None) -> daily.Summary | None:
+        """Итоги дня: всего отдела или одной команды (group_id) — для её чата."""
         if not self.ref:
             return None
         d = date.fromisoformat(day)
@@ -306,22 +402,37 @@ class LeadupBot:
             daily.DayLead(str(r["at"]), str(r["operator_id"]), str(r["group_id"]) if r.get("group_id") is not None else None, str(r.get("status") or "work"))
             for r in lead_rows
         ]
-        shifts = [daily.DayShift(str(r["date"]), str(r["operator_id"]), float(r.get("hours") or 0), str(r.get("type") or "work")) for r in shift_rows]
+        shifts = [
+            daily.DayShift(
+                str(r["date"]), str(r["operator_id"]), float(r.get("hours") or 0), str(r.get("type") or "work"),
+                str(r["group_id"]) if r.get("group_id") is not None else None,
+            )
+            for r in shift_rows
+        ]
         ref = self.ref
-        return daily.build_summary(day, leads, shifts, ref.operators, ref.groups, ref.plans, ref.settings)
+        return daily.build_summary(day, leads, shifts, ref.operators, ref.groups, ref.plans, ref.settings, group_id)
 
     async def send_daily_summary(self, day: str) -> None:
-        if not self.engine or not await self._chat_id():
+        """Каждой команде — её итоги в её чат; в общий чат отдела (если он есть) — итоги всего отдела."""
+        chats = await self._chats(force=True)
+        if not self.engine or not chats.any():
             return
-        summary = await self.build_daily_summary(day)
-        if summary is None:
-            return
-        if daily.is_quiet(summary):
-            log.info("daily.summary.skipped day=%s reason=quiet", day)
-        else:
+        places: list[tuple[str | None, int]] = [(gid, c) for gid, c in chats.groups.items() if self.ref and gid in self.ref.groups]
+        if chats.main and chats.main not in chats.groups.values():
+            places.append((None, chats.main))
+        for gid, chat_id in places:
+            summary = await self.build_daily_summary(day, gid)
+            if summary is None:
+                return
+            if daily.is_quiet(summary):
+                log.info("daily.summary.skipped day=%s group=%s reason=quiet", day, gid or "-")
+                continue
+            # итоги отдела — прежний ключ, чтобы после обновления бота не продублировать сегодняшние
+            key = f"daily_summary:{day}:{gid}" if gid else f"daily_summary:{day}"
             await self.engine.emit_once(
-                f"daily_summary:{day}", "daily_summary", daily.render(summary),
-                {"day": day, "leads": summary.leads, "pending": summary.pending, "hours": summary.hours},
+                key, "daily_summary", daily.render(summary),
+                {"day": day, "group_id": gid, "leads": summary.leads, "pending": summary.pending, "hours": summary.hours},
+                target=chat_target(chat_id),
             )
         self._daily_done = day
 
@@ -346,7 +457,7 @@ class LeadupBot:
 
     # ── участники рабочего чата ────────────────────────────────────────────
     async def _sync_member(self, chat_id: int, user_id: int, reason: str) -> None:
-        if not self.tag_sync or chat_id != await self._chat_id():
+        if not self.tag_sync or chat_id not in (await self._chats()).all():
             return
         link = self.tag_sync.by_telegram_id(user_id)
         if link:
@@ -367,20 +478,19 @@ class LeadupBot:
     async def on_my_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Боту выдали или забрали права в рабочем чате — сразу пересчитать теги."""
         cmu = update.my_chat_member
-        if not cmu or not self.tag_sync or cmu.chat.id != await self._chat_id():
+        if not cmu or not self.tag_sync or cmu.chat.id not in (await self._chats()).all():
             return
-        self.tag_sync.invalidate_rights()
+        self.tag_sync.invalidate_rights(cmu.chat.id)
         rights = await self.tag_sync.rights(cmu.chat.id, force=True)
         if rights == RIGHTS_OK:
             await self.tag_sync.reconcile_all("bot_rights", verify=True)
 
-    async def _rights_alert(self, status: str) -> None:
-        """Предупреждение в рабочий чат, что тегами управлять нельзя. Не чаще раза в сутки на статус."""
-        chat_id = await self._chat_id()
+    async def _rights_alert(self, status: str, chat_id: int) -> None:
+        """Предупреждение в тот рабочий чат, где тегами управлять нельзя. Не чаще раза в сутки на статус и чат."""
         if not chat_id:
             return
         now = datetime.now(timezone.utc)
-        last = await self.db.get_state("tag_rights_alert") or ""
+        last = await self.db.get_state(f"tag_rights_alert:{chat_id}") or ""
         last_status, _, last_at = last.partition("|")
         try:
             recent = last_status == status and now - datetime.fromisoformat(last_at) < RIGHTS_ALERT_REPEAT
@@ -389,19 +499,30 @@ class LeadupBot:
         if recent:
             return
         await self.app.bot.send_message(chat_id=chat_id, text=messages.rights_warning(status), parse_mode=ParseMode.HTML)
-        await self.db.set_state("tag_rights_alert", f"{status}|{now.isoformat()}")
+        await self.db.set_state(f"tag_rights_alert:{chat_id}", f"{status}|{now.isoformat()}")
         log.warning("telegram.tag.rights_alert_sent chat_id=%s status=%s", chat_id, status)
 
     # ── события лидов ──────────────────────────────────────────────────────
-    async def send_event(self, text: str) -> None:
-        chat_id = await self.db.get_chat_id()
-        if not chat_id:
-            raise RuntimeError("Telegram work chat is not connected")
-        await self.app.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-        )
+    async def send_event(self, text: str, target: Target) -> None:
+        """Событие — в чат команды оператора/группы, события отдела — во все чаты (chats.Target)."""
+        chats = await self._chats()
+        targets = chats.resolve(target)
+        if not targets:
+            if not chats.any():
+                raise RuntimeError("Telegram work chat is not connected")
+            # у команды нет своего чата и общего чата отдела нет — некуда; в чужую команду не шлём
+            log.warning("telegram.event.no_chat target=%s:%s", target[0], target[1])
+            return
+        failed: list[Exception] = []
+        for chat_id in targets:
+            try:
+                await self.app.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+            except Exception as exc:  # noqa: BLE001 — один недоступный чат не должен лишать остальные
+                log.warning("telegram.event.send_failed chat_id=%s error=%s", chat_id, exc)
+                failed.append(exc)
+        # не ушло никуда — поднимаем: событие вернётся в очередь и отправится повторно
+        if len(failed) == len(targets):
+            raise failed[0]
 
     def mention(self, op: Operator) -> str:
         """Оператор в уведомлении: «@username Фамилия Имя» (или имя-ссылка), если Telegram привязан."""
@@ -428,7 +549,7 @@ class LeadupBot:
             sync = TagSync(
                 self.db, TelegramTagApi(self.app.bot), self.cache,
                 lambda: self.ref.operators if self.ref else {},
-                self._chat_id, self.cfg.app_timezone, on_rights_problem=self._rights_alert,
+                self._chat_for_operator, self.cfg.app_timezone, on_rights_problem=self._rights_alert,
             )
             await sync.load()
         except Exception:
@@ -467,7 +588,7 @@ class LeadupBot:
         # Reconcile the latest active day. On the first ever run all existing keys were seeded above,
         # so this remains silent. On later Railway restarts it restores achievements that happened
         # while the process was offline.
-        if self.cache.team_day and await self.db.get_chat_id():
+        if self.cache.team_day and (await self._chats(force=True)).any():
             await self.engine.reconcile_day(max(self.cache.team_day))
 
         latest = max((x.updated_at for x in leads if x.updated_at), default=datetime.now(timezone.utc).isoformat())
@@ -490,7 +611,7 @@ class LeadupBot:
 
                 # Until /connect is completed, keep the cursor untouched so achievements
                 # created after the bot started can still be delivered once the chat is linked.
-                if not await self.db.get_chat_id():
+                if not (await self._chats()).any():
                     await asyncio.sleep(self.cfg.poll_interval)
                     continue
 

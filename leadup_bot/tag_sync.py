@@ -1,5 +1,8 @@
 """Синхронизация пользовательских тегов «Грейд I–IV» в рабочем чате.
 
+Тег ставится в чате команды оператора (группа в его карточке), а если у группы своего чата нет —
+в общем чате отдела (см. chats.py). Перевели в другую команду — тег в прежнем чате снимается.
+
 Источник правды — число ДОВЕДЁННЫХ лидов оператора за сегодня (APP_TIMEZONE) в MetricsCache.
 Состояние «какой тег уже стоит» хранится в operator_telegram.tag_synced, поэтому после
 рестарта бот не дёргает Telegram зря, а сверка (reconcile) догоняет всё пропущенное:
@@ -79,18 +82,19 @@ class TagSync:
         api: TagApi,
         cache: MetricsCache,
         operators: Callable[[], dict[str, Operator]],
-        chat_id: Callable[[], Awaitable[int | None]],
+        chat_id: Callable[[str], Awaitable[int | None]],
         tz: tzinfo,
         *,
         now: Callable[[], datetime] | None = None,
         clock: Callable[[], float] | None = None,
-        on_rights_problem: Callable[[str], Awaitable[None]] | None = None,
+        on_rights_problem: Callable[[str, int], Awaitable[None]] | None = None,
         pause: float = RECONCILE_PAUSE,
     ) -> None:
         self.store = store
         self.api = api
         self.cache = cache
         self.operators = operators
+        # чат, где стоит тег оператора: чат его команды, без него — общий чат отдела (chats.Chats.for_group)
         self.chat_id = chat_id
         self.tz = tz
         self._now = now or (lambda: datetime.now(timezone.utc))
@@ -99,7 +103,7 @@ class TagSync:
         self.pause = pause
         self.links: dict[str, TelegramLink] = {}
         self._locks: dict[str, asyncio.Lock] = {}
-        self._rights: tuple[int, str, float] | None = None  # (chat_id, status, checked_at)
+        self._rights: dict[int, tuple[str, float]] = {}  # chat_id → (status, checked_at)
         self._reconcile_lock = asyncio.Lock()
 
     # ── состояние ──────────────────────────────────────────────────────────
@@ -146,37 +150,44 @@ class TagSync:
             setattr(link, k, v)
 
     # ── права бота ─────────────────────────────────────────────────────────
-    def invalidate_rights(self) -> None:
-        self._rights = None
+    def invalidate_rights(self, chat_id: int | None = None) -> None:
+        if chat_id is None:
+            self._rights.clear()
+        else:
+            self._rights.pop(chat_id, None)
 
     async def rights(self, chat_id: int, *, force: bool = False) -> str:
+        """Права бота в этом чате. У каждого чата команды — свои (бот может быть админом в одном и нет в другом)."""
         now = self._clock()
-        if not force and self._rights and self._rights[0] == chat_id and now - self._rights[2] < RIGHTS_CACHE_SECONDS:
-            return self._rights[1]
+        cached = self._rights.get(chat_id)
+        if not force and cached and now - cached[1] < RIGHTS_CACHE_SECONDS:
+            return cached[0]
         try:
             status = await self.api.bot_rights(chat_id)
         except Exception as exc:  # noqa: BLE001 — сбой проверки прав не должен ронять синхронизацию
             err = classify(exc)
             log.warning("telegram.tag.rights_check_failed chat_id=%s reason=%s", chat_id, err.kind)
             status = "error"
-        prev = self._rights[1] if self._rights else await self._stored_rights()
-        self._rights = (chat_id, status, now)
+        prev = cached[0] if cached else await self._stored_rights(chat_id)
+        self._rights[chat_id] = (status, now)
         if status != prev:
             log.info("telegram.tag.rights chat_id=%s status=%s previous=%s", chat_id, status, prev)
             try:
+                # по чату — для CRM (права в чате команды оператора) и общий ключ — как раньше
+                await self.store.set_state(f"tag_rights:{chat_id}", status)
                 await self.store.set_state("tag_rights", status)
             except Exception:
                 log.exception("telegram.tag.rights_state_save_failed")
             if status in RIGHTS_MISSING and self.on_rights_problem:
                 try:
-                    await self.on_rights_problem(status)
+                    await self.on_rights_problem(status, chat_id)
                 except Exception:
                     log.exception("telegram.tag.rights_alert_failed")
         return status
 
-    async def _stored_rights(self) -> str | None:
+    async def _stored_rights(self, chat_id: int) -> str | None:
         try:
-            return await self.store.get_state("tag_rights")
+            return await self.store.get_state(f"tag_rights:{chat_id}")
         except Exception:  # noqa: BLE001 — нет состояния в базе, значит права ещё не проверялись
             return None
 
@@ -200,10 +211,12 @@ class TagSync:
     async def _sync_locked(self, link: TelegramLink, *, verify: bool, reason: str) -> str:
         if self.links.get(link.operator_id) is not link:
             return "skipped:not_linked"  # пока ждали блокировку — отвязали или переподключили
-        chat_id = await self.chat_id()
+        chat_id = await self.chat_id(link.operator_id)
         if not chat_id:
             await self._save(link, chat_status="no_chat")
             return "skipped:no_chat"
+        if link.tag_chat_id and link.tag_chat_id != chat_id:
+            await self._clear_old_chat(link)
 
         desired = self.desired_tag(link.operator_id)
         known_member = link.chat_status == "member" and link.tag_chat_id == chat_id
@@ -246,6 +259,18 @@ class TagSync:
                  link.operator_id, link.telegram_user_id, tag_slug(before), tag_slug(desired), reason)
         return "changed"
 
+    async def _clear_old_chat(self, link: TelegramLink) -> None:
+        """Оператора перевели в другую команду (или чат команды переподключили): тег в прежнем чате снимаем,
+        чтобы там не висел вчерашний грейд. Не вышло — не страшно, главное — тег в новом чате."""
+        old = link.tag_chat_id
+        if old and link.tag_synced:
+            try:
+                await self._set_tag(old, link.telegram_user_id, "")
+                log.info("telegram.tag.moved operator_id=%s from_chat=%s", link.operator_id, old)
+            except TagError as err:
+                log.info("telegram.tag.old_chat_clear_skipped operator_id=%s chat_id=%s reason=%s", link.operator_id, old, err.kind)
+        await self._save(link, tag_synced=None, tag_chat_id=None)
+
     async def _member(self, chat_id: int, link: TelegramLink) -> MemberInfo | None:
         try:
             return await self.api.member(chat_id, link.telegram_user_id)
@@ -276,7 +301,7 @@ class TagSync:
             await self._save(link, chat_status="admin", tag_synced=None, tag_chat_id=None, last_error=None)
             return "skipped:admin"
         if err.kind == "no_rights":
-            self.invalidate_rights()  # права отобрали на лету — перепроверим при следующем обращении
+            self.invalidate_rights()  # права отобрали на лету — перепроверим при следующем обращении (во всех чатах)
         await self._record_error(link, err)
         return f"failed:{err.kind}"
 
@@ -325,7 +350,8 @@ class TagSync:
         if self.by_telegram_id(u.telegram_user_id):
             return "relinked"  # этот Telegram уже снова чей-то — тег ведёт обычная синхронизация
         stale = self._age_days(u.unlinked_at) >= UNLINK_RETRY_DAYS
-        chat_id = await self.chat_id()
+        # тег стоит в чате команды этой карточки
+        chat_id = await self.chat_id(u.operator_id)
         if not chat_id:
             return "no_chat" if stale else None
         if await self.rights(chat_id) != RIGHTS_OK:

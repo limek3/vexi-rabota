@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 import httpx
 
+from .chats import GROUP_PREFIX, MAIN_KEY, Chats
 from .models import (
     Group,
     Lead,
@@ -110,7 +111,7 @@ class SupabaseDB:
         """Смены за даты [from, to] (для итогов дня: часы и кто завтра на смене)."""
         return await self.fetch_all(
             "shifts",
-            select="date,operator_id,hours,type",
+            select="date,operator_id,hours,type,group_id",
             params={"and": f"(date.gte.{date_from},date.lte.{date_to})"},
         )
 
@@ -176,6 +177,29 @@ class SupabaseDB:
 
     async def set_chat_id(self, chat_id: int) -> None:
         await self.set_state("telegram_chat_id", str(chat_id))
+
+    async def delete_state(self, key: str) -> None:
+        await self._request("DELETE", "telegram_bot_state", params={"key": f"eq.{key}"})
+
+    async def load_chats(self) -> Chats:
+        """Общий чат отдела и чаты команд (см. chats.py)."""
+        rows = await self.fetch_all("telegram_bot_state", select="key,value", params={"key": f"like.{MAIN_KEY}*"})
+        return Chats.from_state({str(r["key"]): str(r.get("value") or "") for r in rows})
+
+    async def connect_chat(self, chat_id: int, group_id: str | None) -> Chats:
+        """Подключить чат к группе (group_id) или общим чатом отдела (None). Один чат — одно место:
+        прежние подключения этого чата снимаются, у группы может быть только один чат."""
+        chats = await self.load_chats()
+        for gid, c in chats.groups.items():
+            if c == chat_id and gid != group_id:
+                await self.delete_state(GROUP_PREFIX + gid)
+        if group_id:
+            await self.set_state(GROUP_PREFIX + group_id, str(chat_id))
+            if chats.main == chat_id:
+                await self.delete_state(MAIN_KEY)
+        else:
+            await self.set_state(MAIN_KEY, str(chat_id))
+        return await self.load_chats()
 
     async def claim_event(self, event_key: str, event_type: str, payload: dict[str, Any]) -> bool:
         body = {

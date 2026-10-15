@@ -158,3 +158,23 @@ def test_fired_not_on_shift_after_fire_date():
     assert [x.op.id for x in s.no_leads] == ["l"]
     assert [x.op.id for x in s.tomorrow] == ["d"]
     assert "Ушедший" not in render(s)
+
+
+def test_team_summary_only_its_people_and_plan():
+    # две команды: у каждой свой чат и свои итоги
+    ops = dict(OPS, u=op("u", "Усанин Дмитрий", group="g2", plan=66))
+    groups = dict(GROUPS, g2=Group(id="g2", name="Группа 2", monthly_plan=0, active=True, deleted_at=None))
+    ls = leads("k", 8) + [DayLead(f"{DAY}T11:0{i}", "u", "g2", "done") for i in range(3)]
+    sh = [DayShift(DAY, "k", 7.5, "work"), DayShift(DAY, "u", 6, "work", "g2"), DayShift("2026-09-26", "u", 8, "work")]
+    s2 = build_summary(DAY, ls, sh, ops, groups, {}, SETTINGS, "g2")
+    assert s2.company == "Группа 2"
+    assert s2.leads == 3 and s2.hours == 6
+    assert [x.op.id for x in s2.top] == ["u"]
+    assert s2.groups == [], "в итогах команды нет строк по другим группам"
+    assert round(s2.day_plan, 2) == 3.0  # план группы = план Усанина 66 ÷ 22 рабочих дня
+    assert s2.month_plan == 66
+    assert [x.op.id for x in s2.tomorrow] == ["u"]
+    s1 = build_summary(DAY, ls, sh, ops, groups, {}, SETTINGS, "g1")
+    assert s1.leads == 8 and "u" not in [x.op.id for x in s1.top]
+    whole = build_summary(DAY, ls, sh, ops, groups, {}, SETTINGS)
+    assert whole.leads == 11 and len(whole.groups) == 2

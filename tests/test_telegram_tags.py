@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from telegram.error import BadRequest, Forbidden
 
+from leadup_bot.chats import TEAM, Chats, chat_target, group_target
 from leadup_bot.config import Config
 from leadup_bot.events import EventEngine, ReferenceData
 from leadup_bot.grades import grade_for, grade_tag, local_today
@@ -82,6 +83,9 @@ class FakeStore:
     async def get_chat_id(self) -> int | None:
         return self.chat_id
 
+    async def load_chats(self) -> Chats:
+        return Chats(main=self.chat_id)
+
     # EventEngine: журнал поздравлений
     async def claim_event(self, key: str, typ: str, payload: dict) -> bool:
         if key in self.state:
@@ -100,6 +104,7 @@ class FakeTelegram:
         self.rights_status = rights
         self.members: dict[int, MemberInfo] = {}
         self.calls: list[tuple] = []
+        self.chat_sets: list[tuple[int, int, str]] = []  # (чат, пользователь, тег)
         self.log: list[tuple[str, Any]] | None = None
         self.fail_set: Exception | None = None
 
@@ -120,6 +125,7 @@ class FakeTelegram:
 
     async def set_tag(self, chat_id: int, user_id: int, tag: str) -> None:
         self.calls.append(("set", user_id, tag))
+        self.chat_sets.append((chat_id, user_id, tag))
         if self.fail_set:
             raise classify(self.fail_set)
         m = self.members.get(user_id)
@@ -146,12 +152,12 @@ class Clock:
 
 def make_sync(store: FakeStore, tg: FakeTelegram, cache: MetricsCache, ops: dict[str, Operator],
               clock: Clock, alerts: list[str] | None = None) -> TagSync:
-    async def on_problem(status: str) -> None:
+    async def on_problem(status: str, chat_id: int | None = None) -> None:
         if alerts is not None:
             alerts.append(status)
 
     return TagSync(
-        store, tg, cache, lambda: ops, store.get_chat_id, MSK,
+        store, tg, cache, lambda: ops, lambda _op: store.get_chat_id(), MSK,
         now=clock, clock=lambda: clock.t, on_rights_problem=on_problem, pause=0,
     )
 
@@ -226,7 +232,7 @@ def test_fired_operator_gets_no_tag() -> None:
 # ── 14. Рост и понижение через поток изменений лидов ────────────────────────
 
 def _engine(store: FakeStore, sync: TagSync, cache: MetricsCache, ops: dict[str, Operator], sent: list) -> EventEngine:
-    async def sender(text: str) -> None:
+    async def sender(text: str, target: Any = None) -> None:
         sent.append(("msg", text))
 
     async def hook(op_id: str) -> None:
@@ -514,6 +520,7 @@ def _bot(db: LinkDB, tg: FakeTelegram, cache: MetricsCache):
         telegram_token="123456:TEST-TOKEN", supabase_url="https://example.supabase.co", supabase_service_key="x",
         setup_secret="s", admin_ids=frozenset(), poll_interval=4, reference_refresh=30, log_level="INFO",
         app_timezone=MSK, bot_username="VexiTestBot", tag_reconcile_interval=300, tag_verify_interval=3600,
+        daily_summary_at=None,
     )
     bot = LeadupBot(cfg)
     bot.db = db  # type: ignore[assignment]
@@ -641,7 +648,7 @@ def test_bootstrap_restores_tags_before_missed_congratulations(monkeypatch: pyte
         bot.tag_sync = None
         bot.cache = MetricsCache()
 
-        async def send(text: str) -> None:
+        async def send(text: str, target: Any = None) -> None:
             order.append(("msg", text))
 
         monkeypatch.setattr(bot, "send_event", send)
@@ -693,7 +700,7 @@ def test_grade_notification_mentions_linked_operator() -> None:
         await bot.tag_sync.load()
         sent: list[str] = []
 
-        async def sender(text: str) -> None:
+        async def sender(text: str, target: Any = None) -> None:
             sent.append(text)
 
         engine = EventEngine(db, cache, bot.ref, sender, on_operator_change=bot.on_operator_change, mention=bot.mention)  # type: ignore[arg-type]
@@ -740,7 +747,7 @@ def test_only_title_is_bold_everywhere() -> None:
 def _soon_engine(today: str | None):
     store, cache, sent = FakeStore(), MetricsCache(), []
 
-    async def sender(text: str) -> None:
+    async def sender(text: str, target: Any = None) -> None:
         sent.append(text)
 
     ops = {"op1": op(name="Оленчук Борис")}
@@ -798,5 +805,135 @@ def test_grade_soon_reconciled_after_restart_only_if_still_actual() -> None:
         cache.load([lead(i) for i in range(6)])                        # уже 6 — подсказка устарела
         await engine.reconcile_day(DAY)
         assert not any("ЕЩЁ 1 ЛИД" in t for t in sent)
+
+    run(scenario())
+
+
+# ── Чаты команд: каждой группе — свой чат ───────────────────────────────────
+
+CHAT2 = -200600
+
+
+def test_chats_routing() -> None:
+    teams = Chats(main=None, groups={"g1": CHAT, "g2": CHAT2})
+    assert teams.for_group("g2") == CHAT2
+    assert teams.for_group("g3") is None, "у группы нет чата и общего нет — в чужую команду не шлём"
+    assert teams.resolve(TEAM) == [CHAT, CHAT2]
+    assert teams.resolve(group_target("g1")) == [CHAT]
+    assert teams.resolve(chat_target(CHAT2)) == [CHAT2]
+    assert teams.group_of(CHAT2) == "g2"
+    with_main = Chats(main=-9, groups={"g1": CHAT})
+    assert with_main.for_group("g2") == -9 and with_main.for_group(None) == -9
+    assert with_main.resolve(TEAM) == [-9, CHAT]
+    assert Chats.from_state({"telegram_chat_id": "-9", "telegram_chat_id:group:g2": str(CHAT2), "telegram_chat_id:group:": "1",
+                             "telegram_chat_id:group:bad": "x"}) == Chats(-9, {"g2": CHAT2})
+
+
+def test_operator_events_go_to_his_team_and_team_events_to_all() -> None:
+    async def scenario() -> None:
+        store, cache = FakeStore(), MetricsCache()
+        sent: list[tuple[str, Any]] = []
+
+        async def sender(text: str, target: Any = None) -> None:
+            sent.append((text.split("\n")[0], target))
+
+        # Усанин — во второй команде; лиды записаны с группой g2
+        ops = {"op1": op(name="Усанин Дмитрий", group_id="g2", monthly_plan=66)}
+        engine = EventEngine(store, cache, ReferenceData(ops, {}, {}, Settings()), sender)  # type: ignore[arg-type]
+        for i in range(6):
+            await engine.process_lead_change(Lead(f"L{i}", f"{DAY}T10:{i:02d}", "op1", "g2", "done", f"{DAY}T10:{i:02d}:00Z"))
+        grade = [t for title, t in sent if "НОВЫЙ ГРЕЙД" in title]
+        plan = [t for title, t in sent if "ПЛАН ДНЯ ЗАКРЫТ" in title]
+        assert grade == [group_target("g2")] and plan == [group_target("g2")]
+        assert engine.target_of({"day": DAY}) == TEAM, "события отдела — во все чаты"
+        assert engine.target_of({"group_id": "g1"}) == group_target("g1")
+
+    run(scenario())
+
+
+def test_tag_in_team_chat_and_moves_with_operator() -> None:
+    async def scenario() -> None:
+        store, tg, cache = FakeStore([linked()]), FakeTelegram(), MetricsCache()
+        tg.join(777)
+        ops = {"op1": op(group_id="g1")}
+        teams = Chats(groups={"g1": CHAT, "g2": CHAT2})
+
+        async def chat_for(op_id: str) -> int | None:
+            return teams.for_group(ops[op_id].group_id)
+
+        sync = TagSync(store, tg, cache, lambda: ops, chat_for, MSK, now=Clock(at_msk(DAY)), clock=lambda: 0.0, pause=0)
+        await sync.load()
+        await sync.sync_operator("op1", verify=True)
+        assert tg.chat_sets[-1] == (CHAT, 777, "Грейд I")
+        assert store.rows["op1"].tag_chat_id == CHAT
+
+        ops["op1"] = op(group_id="g2")                 # перевели во вторую команду
+        await sync.sync_operator("op1")
+        assert (CHAT, 777, "") in tg.chat_sets, "в прежнем чате тег снят"
+        assert tg.chat_sets[-1] == (CHAT2, 777, "Грейд I")
+        assert store.rows["op1"].tag_chat_id == CHAT2
+
+    run(scenario())
+
+
+def test_rights_are_checked_per_chat() -> None:
+    async def scenario() -> None:
+        store, cache = FakeStore([linked(), linked("op2", 778)]), MetricsCache()
+        tg = FakeTelegram()
+        tg.join(777)
+        tg.join(778)
+        rights = {CHAT: "ok", CHAT2: "no_manage_tags"}
+
+        async def bot_rights(chat_id: int) -> str:
+            return rights[chat_id]
+
+        tg.bot_rights = bot_rights  # type: ignore[method-assign]
+        ops = {"op1": op(group_id="g1"), "op2": op("op2", "Второй Оператор", group_id="g2")}
+        teams = Chats(groups={"g1": CHAT, "g2": CHAT2})
+        alerts: list[tuple[str, int]] = []
+
+        async def chat_for(op_id: str) -> int | None:
+            return teams.for_group(ops[op_id].group_id)
+
+        async def on_problem(status: str, chat_id: int) -> None:
+            alerts.append((status, chat_id))
+
+        sync = TagSync(store, tg, cache, lambda: ops, chat_for, MSK, now=Clock(at_msk(DAY)), clock=lambda: 0.0,
+                       on_rights_problem=on_problem, pause=0)
+        await sync.load()
+        await sync.reconcile_all("startup", verify=True)
+        assert tg.tag(777) == "Грейд I", "в первой команде права есть — тег стоит"
+        assert store.rows["op2"].chat_status == "no_rights"
+        assert alerts == [("no_manage_tags", CHAT2)], "предупреждение — только в чат, где нет прав"
+        assert store.state[f"tag_rights:{CHAT2}"] == "no_manage_tags" and store.state[f"tag_rights:{CHAT}"] == "ok"
+
+    run(scenario())
+
+
+def test_send_event_routes_by_team(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        db = LinkDB()
+        bot = _bot(db, FakeTelegram(), MetricsCache())
+        sent: list[int] = []
+
+        async def send_message(chat_id: int, text: str, **kw: Any) -> None:
+            if chat_id == CHAT2 and "сломан" in text:
+                raise RuntimeError("chat is down")
+            sent.append(chat_id)
+
+        bot._chat_cache = (Chats(groups={"g1": CHAT, "g2": CHAT2}), 1e18)
+        fake = SimpleNamespace(send_message=send_message)
+        monkeypatch.setattr(type(bot.app), "bot", property(lambda self: fake))
+        await bot.send_event("x", group_target("g2"))
+        assert sent == [CHAT2]
+        sent.clear()
+        await bot.send_event("x", TEAM)
+        assert sent == [CHAT, CHAT2]
+        sent.clear()
+        await bot.send_event("x", group_target("g3"))      # у команды нет чата — молча пропускаем
+        assert sent == []
+        sent.clear()
+        await bot.send_event("сломан", TEAM)                # один чат недоступен — в остальные ушло
+        assert sent == [CHAT]
 
     run(scenario())
